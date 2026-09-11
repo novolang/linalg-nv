@@ -1,0 +1,227 @@
+// lalu — the LU factorisation with partial pivoting, which is the one
+// every other function in this package falls back to.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  `P A = L U`: a permutation, a unit-lower-triangular
+// factor and an upper-triangular one.  Gaussian elimination with the
+// largest remaining entry in each column chosen as the pivot, which is
+// what makes it numerically stable — without pivoting, a matrix as
+// benign as `[[0, 1], [1, 0]]` divides by zero on the first step.
+//
+// LAPACK: `dgetrf` factors, `dgetrs` solves, `dgecon` estimates the
+// condition number, `dgetri` inverts.  Every function here names the
+// routine it mirrors, and the README says why that matters: a result
+// that disagrees with LAPACK is this package's fault, and a reader has
+// to be able to find the thing to compare against.
+//
+// THE LOAD-BEARING DECISION, AND IT IS THIS PACKAGE'S WHOLE SHAPE: A
+// DECOMPOSITION IS A VALUE THAT HOLDS ITS FACTORS.  `factor` answers an
+// `LaLu`; `solve` takes one.  A caller solving `A x = b` for fifty
+// different `b` — which is what a simulation step, a Kalman filter and
+// a Newton iteration all do — factors once and solves fifty times, at
+// `n³/3` for the factorisation and `n²` for each solve.  An API of one
+// `solve(A, b)` function would have hidden that and done the cubic work
+// fifty times.
+//
+// And a value, not a handle: no `init`, no `free`, no mutation.  An
+// `LaLu` can live in a struct beside the matrix it came from, be
+// copied, and be used from two places; it cannot be stale, because
+// nothing changes it.  That is also what keeps this package at `core`
+// with nothing carried between calls.
+//
+// THE PACKED FORM IS NOT PUBLISHED, ON PURPOSE.  LAPACK stores `L` and
+// `U` in the same array, because `L`'s diagonal is all ones and there
+// is exactly enough room.  That is the right storage and the wrong API:
+// a caller who wants `L` should get `L`.  So `LaLu` holds the packed
+// array as its field, and `lower`, `upper` and `permutation` are
+// functions that unpack — a copy each, paid only by the caller who
+// asks, which is almost nobody, because `solve` reads the packed form
+// directly.
+
+use ndfloat
+
+// LaLu is the LU factorisation of a square matrix, with its pivots.
+//
+// Build it with `factor` and keep it for as long as the matrix lives.
+// The fields are public because a reader checking this against
+// `dgetrf`'s documented output needs to see the packed layout, and
+// because a test can then assert the pivot sequence directly rather
+// than only through a solve.
+//
+// ```novo
+// use ndfloat
+// use lalu
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lalu.factor(a)
+//                 Ok(lu) => println("${lalu.order(lu)}")   // 3
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct LaLu
+    // `L` and `U` in one `n x n` matrix, LAPACK's packing: the strict
+    // lower triangle is `L`'s (its diagonal is all ones and is not
+    // stored), and the upper triangle including the diagonal is `U`.
+    packed: NdFloat
+    // The row swaps, in the order they were applied: `pivots[i]` is the
+    // row that was exchanged with row `i` at step `i`.  LAPACK's
+    // `ipiv`, zero-based rather than one-based.
+    pivots: [Int]
+    // How many row exchanges were actually performed — even means the
+    // permutation's determinant is +1 and odd means -1, which is the
+    // sign `determinant` needs and the only thing it needs the
+    // permutation for.
+    swaps: Int
+
+// The LU factorisation of a square matrix, with partial pivoting.
+//
+// LAPACK `dgetrf`.  `LaNotMatrix` for an array that is not rank 2,
+// `LaNotSquare` for a non-square one, `LaEmptyMatrix` for a zero
+// dimension, and `LaSingular` with the column and the pivot when a
+// column is entirely zero below the diagonal.
+//
+// A matrix that is merely ill-conditioned factors fine and says nothing
+// — the factorisation cannot tell, which is what `lanorm.condition` is
+// for. `LaSingular` here means exactly zero to within the working
+// precision, not "nearly singular".
+pub fn factor(a: NdFloat) -> Result<LaLu, LaFault> []
+    todo("linalg-nv.lalu.factor")
+
+// How many rows the factored matrix had.
+pub fn order(lu: LaLu) -> Int []
+    todo("linalg-nv.lalu.order")
+
+// The unit-lower-triangular factor `L`, unpacked into its own `n x n`
+// matrix with ones on the diagonal.
+//
+// A copy.  See the module comment: the packed form is the storage and
+// this is the API.
+pub fn lower(lu: LaLu) -> NdFloat []
+    todo("linalg-nv.lalu.lower")
+
+// The upper-triangular factor `U`, unpacked.
+pub fn upper(lu: LaLu) -> NdFloat []
+    todo("linalg-nv.lalu.upper")
+
+// The permutation `P` as an `n x n` matrix of zeros and ones, so that
+// `P A = L U` can be checked directly.
+//
+// A permutation matrix is a wasteful way to store a permutation and an
+// excellent way to verify one, which is the whole reason it is here:
+// the suite multiplies the three factors and compares against the
+// original.
+pub fn permutation(lu: LaLu) -> NdFloat []
+    todo("linalg-nv.lalu.permutation")
+
+// The permutation as the index list `perm[i] = j`, meaning row `j` of
+// the original is row `i` of `P A`.
+//
+// What a caller applies to a right-hand side without building a matrix.
+pub fn permutation_indices(lu: LaLu) -> [Int] []
+    todo("linalg-nv.lalu.permutation_indices")
+
+// `x` such that `A x = b`, for a vector `b`.
+//
+// LAPACK `dgetrs`.  Forward substitution through `L` and back
+// substitution through `U`, at `n²` — which is the whole point of
+// keeping the factorisation: fifty right-hand sides cost fifty times
+// `n²` and not fifty times `n³/3`.
+//
+// `LaDimensionMismatch` when `b` is not `n` long, `LaNotVector` when it
+// is not rank 1.
+//
+// ```novo
+// use ndfloat
+// use lalu
+//
+// fn main() [io]
+//     match ndfloat.eye(2)
+//         Ok(a) =>
+//             match lalu.factor(a)
+//                 Ok(lu) =>
+//                     match ndfloat.of_list([1.0, 2.0], [2])
+//                         Ok(b) =>
+//                             match lalu.solve(lu, b)
+//                                 Ok(x)  => println("${ndfloat.size(x)}")   // 2
+//                                 Err(e) => println(e.message())
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn solve(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lalu.solve")
+
+// `X` such that `A X = B`, for a matrix `B` of several right-hand
+// sides at once.
+//
+// The same `dgetrs`, and the call a caller with fifty right-hand sides
+// should reach for instead of fifty `solve`s: one pass over the
+// factors, one allocation, and the inner loops run over columns rather
+// than over calls.
+pub fn solve_matrix(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lalu.solve_matrix")
+
+// The determinant of the factored matrix: the product of `U`'s
+// diagonal, with the sign of the permutation.
+//
+// Not a separate algorithm — the determinant of an LU factorisation is
+// a single pass down a diagonal, which is why nobody should ever
+// compute one by cofactor expansion and why this is the only
+// determinant this package has.
+//
+// Beware the overflow that is inherent rather than this package's: the
+// determinant of a 100 x 100 matrix of entries around 10 is around
+// 10^100, and the product runs through every intermediate on the way.
+// `log_abs_determinant` is the call for anything large.
+pub fn determinant(lu: LaLu) -> Float []
+    todo("linalg-nv.lalu.determinant")
+
+// The natural logarithm of the absolute determinant, and its sign, as a
+// pair.
+//
+// The call a statistician actually wants: a Gaussian log-likelihood
+// needs `log|det Σ|` and never `det Σ`, and computing the second and
+// taking a logarithm overflows for any covariance matrix of interesting
+// size.  Summing the logarithms of `U`'s diagonal does not.
+//
+// `sign` is +1, -1 or 0, and `log_abs` is `-inf` when the sign is 0.
+pub fn log_abs_determinant(lu: LaLu) -> LaLogDet []
+    todo("linalg-nv.lalu.log_abs_determinant")
+
+// LaLogDet is a log-determinant and the sign it lost.
+//
+// A struct rather than a tuple because `d.0` and `d.1` three lines
+// later is how a sign becomes a magnitude.
+pub struct LaLogDet
+    // +1, -1, or 0 for a singular matrix.
+    sign: Float
+    // `log|det A|`, and `-inf` when the determinant is zero.
+    log_abs: Float
+
+// The inverse of the factored matrix.
+//
+// LAPACK `dgetri`.  Present because callers want it and prefaced with
+// the warning every numerical text gives: **to solve `A x = b`, use
+// `solve`.**  Forming the inverse and multiplying is three times the
+// work and loses a digit or two of accuracy, and the only reasons to
+// have an explicit inverse are that a formula genuinely needs its
+// entries — a covariance matrix's, a Hat matrix's — or that it is being
+// displayed.
+//
+// `LaSingular` when the factorisation's `U` has a zero on its diagonal.
+pub fn inverse(lu: LaLu) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lalu.inverse")
+
+// The product `L U` with the permutation undone — the original matrix,
+// reconstructed from the factors.
+//
+// A round trip, and the assertion every decomposition owes: the factors
+// multiply back to what was factored, to within a tolerance the README
+// names.  It costs `n³` and exists for tests and for a reader checking
+// a factorisation by hand, not for a hot path.
+pub fn reconstruct(lu: LaLu) -> NdFloat []
+    todo("linalg-nv.lalu.reconstruct")

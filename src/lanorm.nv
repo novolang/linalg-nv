@@ -1,0 +1,187 @@
+// lanorm — matrix and vector norms, and the two questions that are
+// asked about a matrix before anything is done with it.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// FIVE MATRIX NORMS, AND THEY ARE NOT INTERCHANGEABLE.  `LaNorm` names
+// them, and the reason there are five is that they answer different
+// questions and differ by factors of `sqrt(n)`:
+//
+//   1 (max column sum)  cheap, `n²`, and an upper bound on the 2-norm.
+//   inf (max row sum)   cheap, and the bound an error analysis uses.
+//   Frobenius           the entrywise Euclidean norm; cheap, and the
+//                       one that is differentiable, which is why every
+//                       matrix loss function uses it.
+//   2 (spectral)        the largest singular value; the RIGHT norm for
+//                       anything about how a matrix stretches a vector,
+//                       and the expensive one — it needs an SVD.
+//   max                 the largest absolute entry.  Not a matrix norm
+//                       in the submultiplicative sense and named as
+//                       such, because it is what a reader means by
+//                       "how big is the biggest number in here".
+//
+// LAPACK's `dlange` computes the first three and the last; the 2-norm
+// is `dgesvd`'s job, which is why `norm` with `LaNorm2` is the one call
+// here that costs `n³` and says so.
+//
+// THE CONDITION NUMBER HAS TWO FORMS AND BOTH ARE HERE.  `condition`
+// takes an SVD and is exact; `condition_estimate` takes an LU and
+// guesses, which is LAPACK's `dgecon` and is `n²` on a factorisation
+// the caller already has.  The estimate is what an error bound wants —
+// it only has to be right to an order of magnitude — and the exact one
+// is what a paper reports.  A package with only the exact one would
+// make every solve pay for an SVD.
+
+use ndfloat
+
+// LaNorm names which norm.
+//
+// Prefixed variants because `One`, `Two` and `Max` are names the whole
+// registry would collide over.
+pub enum LaNorm
+    // The maximum absolute column sum.  `n²`, and an upper bound on the
+    // 2-norm.
+    LaNorm1
+    // The maximum absolute row sum.  `n²`, and the bound a backward
+    // error analysis is written in.
+    LaNormInf
+    // The entrywise Euclidean norm: the square root of the sum of the
+    // squares.  `n²`, differentiable, and the norm every matrix
+    // regulariser and every reconstruction error uses.
+    LaNormFrobenius
+    // The spectral norm: the largest singular value, which is the most
+    // any unit vector is stretched by.  Needs an SVD, so `n³`.
+    LaNorm2
+    // The largest absolute entry.  NOT submultiplicative — it is not a
+    // matrix norm in the sense the others are, and is named because it
+    // is what a person means by "the biggest number in here".
+    LaNormMax
+
+// The norm of a matrix.
+//
+// `LaNotMatrix` for an array that is not rank 2.  `LaNorm2` costs an
+// SVD; the other four are one pass.
+//
+// ```novo
+// use ndfloat
+// use lanorm
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lanorm.norm(a, LaNormFrobenius)
+//                 Ok(v)  => println("${v}")   // 1.7320508075688772
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn norm(a: NdFloat, which: LaNorm) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.norm")
+
+// The Euclidean norm of a vector.
+//
+// `LaNotVector` for an array that is not rank 1.  Computed by scaling
+// rather than by summing squares directly, so that a vector of entries
+// around `1e200` does not overflow on the way to a finite answer — the
+// difference between this and the naive loop is the entire reason
+// LAPACK has `dnrm2` instead of three lines.
+pub fn vector_norm(x: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.vector_norm")
+
+// The p-norm of a vector, for a real `p` at or above 1.
+//
+// `LaBadNormOrder` below 1, where the function is not a norm — the
+// triangle inequality fails, and a package that computed it anyway
+// would be answering a number that does not mean what its name says.
+// `inf` as `p` is the maximum absolute entry and is `vector_norm_inf`.
+pub fn vector_norm_p(x: NdFloat, p: Float) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.vector_norm_p")
+
+// The maximum absolute entry of a vector — its infinity norm.
+//
+// Named rather than reached through `vector_norm_p`, because there is
+// no float `p` that means infinity and passing a very large one gives
+// a wrong answer quietly.
+pub fn vector_norm_inf(x: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.vector_norm_inf")
+
+// The dot product of two vectors.
+//
+// Here rather than in ndarray-nv's `dot` because this one is computed
+// the way LAPACK's `ddot` is and the README's accuracy claims cover it;
+// it is also what `vector_norm` and the Gram matrix below are written
+// in terms of.  `LaDimensionMismatch` when the lengths differ.
+pub fn dot(x: NdFloat, y: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.dot")
+
+// The trace: the sum of the diagonal.
+//
+// `LaNotSquare` for a non-square matrix.  It is the sum of the
+// eigenvalues, which is what makes it the cheapest thing that says
+// anything about a spectrum.
+pub fn trace(a: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.trace")
+
+// The exact 2-norm condition number, from a singular value
+// decomposition.
+//
+// The same number `lasvd.condition` answers, reachable from here so
+// that a caller who thinks in norms does not have to know which module
+// the SVD lives in.
+pub fn condition(s: LaSvd) -> Float []
+    todo("linalg-nv.lanorm.condition")
+
+// An estimate of the 1-norm condition number, from an LU factorisation.
+//
+// LAPACK `dgecon`.  Hager's estimator: a few solves against the
+// existing factors, at `n²`, answering a number that is usually within
+// a factor of two or three of the true one and is never above it.
+//
+// That is the right trade for what a condition number is FOR — a
+// caller asking "will this solve lose all my digits" needs an order of
+// magnitude, not three significant figures, and making them pay `n³`
+// for an SVD to find out is how the question stops being asked.
+//
+// `anorm` is the 1-norm of the ORIGINAL matrix, which the caller has
+// and the factorisation does not — `dgecon` takes it for the same
+// reason.
+pub fn condition_estimate(lu: LaLu, anorm: Float) -> Float []
+    todo("linalg-nv.lanorm.condition_estimate")
+
+// How far from symmetric a matrix is: the Frobenius norm of
+// `A - Aᵀ`, relative to the Frobenius norm of `A`.
+//
+// The other half of the question `lachol.is_positive_definite` answers.
+// `lachol` and `laeig` read only the lower triangle and do not check
+// symmetry, because checking costs `n²` comparisons against a tolerance
+// nobody can choose for a caller — so this is where a caller who is not
+// sure asks, once, with a tolerance of their own.
+//
+// Zero for an exactly symmetric matrix, and zero for a 1 x 1 one.
+//
+// ```novo
+// use ndfloat
+// use lanorm
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lanorm.symmetry_defect(a)
+//                 Ok(d)  => println("${d}")   // 0
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn symmetry_defect(a: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.symmetry_defect")
+
+// How far from orthogonal a matrix is: the Frobenius norm of
+// `QᵀQ - I`.
+//
+// The measurement that decides whether a QR implementation is any good,
+// and the reason this package uses Householder reflections rather than
+// Gram-Schmidt — see `laqr`'s module comment.  It is published rather
+// than left in the test suite because a caller who built a rotation
+// matrix by accumulating small rotations wants to know when it has
+// drifted.
+pub fn orthogonality_defect(q: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lanorm.orthogonality_defect")

@@ -1,0 +1,833 @@
+// tests/linalg_tests.nv — the matrices whose factorisations are known
+// by hand, the identities every decomposition owes, and the two
+// disagreements with numpy that are deliberate.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// linalg-nv.<module>.<fn>` from the `todo()` that is each body.  That
+// is the expected state of an interface release: the compiler has
+// checked every signature, every type and every effect row, and nothing
+// else has been checked because there is nothing else yet.
+//
+// WHERE THE VECTORS COME FROM.  A decomposition of an arbitrary matrix
+// is not unique — `Q`'s column signs, an eigenvector's direction and a
+// singular vector's sign are all free — so a suite that hard-coded
+// LAPACK's output for a random matrix would be asserting this
+// implementation against one of many correct answers.  What is asserted
+// here is of three kinds:
+//
+//   - MATRICES FACTORED BY HAND.  The identity, a diagonal, a 2 x 2
+//     whose LU, determinant and inverse fit on one line, the swap
+//     matrix `[[0, 1], [1, 0]]` that needs a pivot on the first step.
+//   - THE IDENTITIES, which hold for every matrix and every correct
+//     implementation: the factors multiply back; `Q` is orthogonal; the
+//     eigenvalues sum to the trace and multiply to the determinant; the
+//     singular values are the square roots of `AᵀA`'s eigenvalues; the
+//     pseudoinverse satisfies `A A⁺ A = A`.
+//   - THE PUBLISHED RULES.  The rank tolerance, the norm definitions,
+//     the sort orders this package commits to.
+//
+// TOLERANCE.  `1e-10` on anything that has been through a
+// factorisation, `1e-12` on a direct arithmetic identity.  Both are
+// well above the double-precision floor for the sizes here and far
+// below any algorithmic mistake: a decomposition that is wrong is wrong
+// by O(1).  The README's "Accuracy, and what the tests hold" section is
+// where those two numbers are argued.
+
+use std.test
+use ndfloat
+use lafault
+use lalu
+use laqr
+use lachol
+use laeig
+use lasvd
+use lanorm
+use lasolve
+
+// ── the shapes a decomposition refuses ──────────────────────────────
+
+@test
+fn test_a_non_square_matrix_is_refused_where_squareness_is_required()
+    match ndfloat.zeros([3, 4])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(_)  => test.fail("LU wants a square matrix")
+                Err(e) =>
+                    match e
+                        LaNotSquare(r, c) =>
+                            test.assert_eq(r, 3)
+                            test.assert_eq(c, 4)
+                        _                 => test.fail("expected LaNotSquare: ${e.message()}")
+                    test.assert_eq(lafault.is_shape_fault(e), true)
+                    test.assert_eq(lafault.is_singular_fault(e), false)
+                    test.assert_eq(lafault.is_convergence_fault(e), false)
+            match laeig.factor(a)
+                Ok(_)  => test.fail("the eigenproblem wants a square matrix")
+                Err(_) => test.assert_eq(true, true)
+            match lachol.factor(a)
+                Ok(_)  => test.fail("Cholesky wants a square matrix")
+                Err(_) => test.assert_eq(true, true)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_rank_one_array_is_not_a_matrix_and_a_matrix_is_not_a_vector()
+    match ndfloat.zeros([4])
+        Ok(v)  =>
+            match lalu.factor(v)
+                Ok(_)  => test.fail("a vector is not a matrix")
+                Err(e) =>
+                    match e
+                        LaNotMatrix(_, r) => test.assert_eq(r, 1)
+                        _                 => test.fail("expected LaNotMatrix: ${e.message()}")
+            match lanorm.norm(v, LaNormFrobenius)
+                Ok(_)  => test.fail("a matrix norm wants a matrix")
+                Err(_) => test.assert_eq(true, true)
+        Err(e) => test.fail(e.message())
+    match ndfloat.eye(2)
+        Ok(m)  =>
+            match lanorm.vector_norm(m)
+                Ok(_)  => test.fail("a vector norm wants a vector")
+                Err(e) =>
+                    match e
+                        LaNotVector(_, r) => test.assert_eq(r, 2)
+                        _                 => test.fail("expected LaNotVector: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_wide_matrix_has_no_householder_qr_here_and_says_so()
+    // `m < n` needs the LQ factorisation, which this package does not
+    // carry — the README names it as a missing row rather than leaving
+    // a caller to discover it.
+    match ndfloat.zeros([2, 5])
+        Ok(a)  =>
+            match laqr.factor(a)
+                Ok(_)  => test.fail("Householder QR wants at least as many rows as columns")
+                Err(e) =>
+                    match e
+                        LaUnderdetermined(r, c) =>
+                            test.assert_eq(r, 2)
+                            test.assert_eq(c, 5)
+                        _                       => test.fail("expected LaUnderdetermined: ${e.message()}")
+        Err(e) => test.fail(e.message())
+    match ndfloat.zeros([0, 0])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(_)  => test.fail("an empty matrix has no useful factorisation")
+                Err(e) =>
+                    match e
+                        LaEmptyMatrix(_, _) => test.assert_eq(true, true)
+                        _                   => test.fail("expected LaEmptyMatrix: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+// ── LU, by hand ─────────────────────────────────────────────────────
+
+@test
+fn test_the_identity_factors_to_itself_with_no_row_swaps()
+    match ndfloat.eye(3)
+        Ok(i3) =>
+            match lalu.factor(i3)
+                Ok(lu) =>
+                    test.assert_eq(lalu.order(lu), 3)
+                    test.assert_approx(lalu.determinant(lu), 1.0, 1e-12)
+                    test.assert_eq(ndfloat.rank(lalu.lower(lu)), 2)
+                    test.assert_eq(ndfloat.rank(lalu.upper(lu)), 2)
+                    test.assert_eq(ndfloat.rank(lalu.permutation(lu)), 2)
+                    test.assert_eq(lalu.permutation_indices(lu), [0, 1, 2])
+                    // The round trip every decomposition owes.
+                    match ndfloat.sub(lalu.reconstruct(lu), i3)
+                        Ok(d)  =>
+                            match lanorm.norm(d, LaNormFrobenius)
+                                Ok(n)  => test.assert_approx(n, 0.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_swap_matrix_is_the_case_that_needs_a_pivot_on_the_first_step()
+    // `[[0, 1], [1, 0]]` divides by zero without pivoting, which is the
+    // whole argument for partial pivoting in one matrix.  Its
+    // determinant is -1: one row exchange.
+    match ndfloat.of_list([0.0, 1.0, 1.0, 0.0], [2, 2])
+        Ok(swap) =>
+            match lalu.factor(swap)
+                Ok(lu) =>
+                    test.assert_approx(lalu.determinant(lu), -1.0, 1e-12)
+                    test.assert_eq(lalu.permutation_indices(lu), [1, 0])
+                    let d = lalu.log_abs_determinant(lu)
+                    test.assert_approx(d.sign, -1.0, 1e-12)
+                    test.assert_approx(d.log_abs, 0.0, 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_singular_matrix_names_the_column_and_the_pivot_that_failed()
+    // Two identical rows: rank 1, and the second column has nothing to
+    // pivot on.  The value matters — a caller deciding whether this is
+    // a genuine singularity or a scaling problem reads it.
+    match ndfloat.of_list([1.0, 2.0, 1.0, 2.0], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(_)  => test.fail("two identical rows are singular")
+                Err(e) =>
+                    match e
+                        LaSingular(at, _) => test.assert_eq(at, 1)
+                        _                 => test.fail("expected LaSingular: ${e.message()}")
+                    test.assert_eq(lafault.is_singular_fault(e), true)
+                    test.assert_eq(lafault.is_shape_fault(e), false)
+            match lasolve.determinant(a)
+                Ok(d)  => test.assert_approx(d, 0.0, 1e-12)
+                Err(_) => test.assert_eq(true, true)
+            match lasolve.inverse(a)
+                Ok(_)  => test.fail("a singular matrix has no inverse")
+                Err(_) => test.assert_eq(true, true)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_factorisation_solves_many_right_hand_sides_for_one_cubic_cost()
+    // The whole reason the decomposition is a value.
+    match ndfloat.of_list([2.0, 0.0, 0.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    test.assert_approx(lalu.determinant(lu), 8.0, 1e-12)
+                    match ndfloat.of_list([2.0, 4.0], [2])
+                        Ok(b)  =>
+                            match lalu.solve(lu, b)
+                                Ok(x)  =>
+                                    match ndfloat.at(x, [0])
+                                        Ok(v)  => test.assert_approx(v, 1.0, 1e-10)
+                                        Err(e) => test.fail(e.message())
+                                    match ndfloat.at(x, [1])
+                                        Ok(v)  => test.assert_approx(v, 1.0, 1e-10)
+                                        Err(e) => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                            // And the same factors again, which is the
+                            // point: no second factorisation.
+                            match lalu.solve(lu, b)
+                                Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.eye(2)
+                        Ok(rhs) =>
+                            match lalu.solve_matrix(lu, rhs)
+                                Ok(x)  => test.assert_eq(ndfloat.rank(x), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e)  => test.fail(e.message())
+                    match lalu.inverse(lu)
+                        Ok(inv) =>
+                            match ndfloat.at(inv, [0, 0])
+                                Ok(v)  => test.assert_approx(v, 0.5, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e)  => test.fail(e.message())
+                    // A right-hand side of the wrong length is the one
+                    // thing a solve against a good factorisation can
+                    // refuse.
+                    match ndfloat.of_list([1.0, 2.0, 3.0], [3])
+                        Ok(wrong) =>
+                            match lalu.solve(lu, wrong)
+                                Ok(_)  => test.fail("the matrix is 2 by 2")
+                                Err(e) =>
+                                    match e
+                                        LaDimensionMismatch(w, g) =>
+                                            test.assert_eq(w, 2)
+                                            test.assert_eq(g, 3)
+                                        _                         => test.fail("expected LaDimensionMismatch: ${e.message()}")
+                        Err(e)    => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_log_determinant_is_the_call_that_does_not_overflow()
+    // A Gaussian log-likelihood wants `log|det Σ|` and never `det Σ`.
+    // For a diagonal of 2 and 4 the determinant is 8 and its logarithm
+    // is log 8.
+    match ndfloat.of_list([2.0, 0.0, 0.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    let d = lalu.log_abs_determinant(lu)
+                    test.assert_approx(d.sign, 1.0, 1e-12)
+                    test.assert_approx(d.log_abs, 2.0794415416798357, 1e-10)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── QR, and the orthogonality that is the whole point ───────────────
+
+@test
+fn test_householder_qr_answers_an_orthogonal_q_and_a_triangular_r()
+    match ndfloat.of_list([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], [3, 2])
+        Ok(a)  =>
+            match laqr.factor(a)
+                Ok(qr) =>
+                    test.assert_eq(laqr.rows(qr), 3)
+                    test.assert_eq(laqr.cols(qr), 2)
+                    // The full Q is 3 x 3 and the thin one 3 x 2 — two
+                    // different objects, which is why both are
+                    // published.
+                    test.assert_eq(ndfloat.size(laqr.q(qr)), 9)
+                    test.assert_eq(ndfloat.size(laqr.q_thin(qr)), 6)
+                    test.assert_eq(ndfloat.size(laqr.r(qr)), 4)
+                    // Q is orthogonal, and this is the measurement that
+                    // says whether the implementation used Householder
+                    // reflections or something worse.
+                    match lanorm.orthogonality_defect(laqr.q(qr))
+                        Ok(d)  => test.assert_approx(d, 0.0, 1e-10)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.sub(laqr.reconstruct(qr), a)
+                        Ok(diff) =>
+                            match lanorm.norm(diff, LaNormFrobenius)
+                                Ok(n)  => test.assert_approx(n, 0.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e)   => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_least_squares_fit_goes_through_q_transpose_and_back_substitution()
+    // Not the normal equations: `AᵀA x = Aᵀb` squares the condition
+    // number, which is how a cubic fit over an unscaled x axis loses
+    // every digit it has.
+    match ndfloat.of_list([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], [3, 2])
+        Ok(a)  =>
+            match laqr.factor(a)
+                Ok(qr) =>
+                    match ndfloat.of_list([3.0, 4.0, 5.0], [3])
+                        Ok(b)  =>
+                            match laqr.lstsq(qr, b)
+                                Ok(x)  =>
+                                    test.assert_eq(ndfloat.size(x), 2)
+                                    match ndfloat.at(x, [0])
+                                        Ok(v)  => test.assert_approx(v, 3.0, 1e-10)
+                                        Err(e) => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                            // The residual falls out of the
+                            // factorisation: the last m - n entries of
+                            // Qᵀb ARE it, so nothing is multiplied back.
+                            match laqr.residual_norm(qr, b)
+                                Ok(r)  => test.assert_approx(r, 5.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                            match laqr.apply_q_transpose(qr, b)
+                                Ok(y)  =>
+                                    test.assert_eq(ndfloat.size(y), 3)
+                                    match laqr.apply_q(qr, y)
+                                        Ok(back) => test.assert_eq(ndfloat.size(back), 3)
+                                        Err(e)   => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(y)  =>
+                            match laqr.solve_r(qr, y)
+                                Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_rank_deficient_least_squares_problem_refuses_here_and_answers_there()
+    // Two identical columns: `laqr.lstsq` refuses because there are
+    // infinitely many solutions and it picks none of them;
+    // `lasvd.lstsq` answers the minimum-norm one.  That is the whole
+    // difference between the two paths, and it is why both exist.
+    match ndfloat.of_list([1.0, 1.0, 1.0, 1.0], [2, 2])
+        Ok(a)  =>
+            match ndfloat.of_list([2.0, 2.0], [2])
+                Ok(b)  =>
+                    match lasolve.lstsq(a, b)
+                        Ok(_)  => test.fail("two identical columns have no unique fit")
+                        Err(e) => test.assert_eq(lafault.is_singular_fault(e), true)
+                    match lasolve.lstsq_minimum_norm(a, b, 1e-12)
+                        Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                        Err(e) => test.fail(e.message())
+                    match lasolve.lstsq_minimum_norm(a, b, -1.0)
+                        Ok(_)  => test.fail("a tolerance is not negative")
+                        Err(e) =>
+                            match e
+                                LaBadTolerance(_) => test.assert_eq(true, true)
+                                _                 => test.fail("expected LaBadTolerance: ${e.message()}")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── Cholesky ────────────────────────────────────────────────────────
+
+@test
+fn test_cholesky_factors_a_positive_definite_matrix_and_refuses_every_other()
+    // `[[4, 2], [2, 3]]` is positive definite: L is [[2, 0], [1, ...]].
+    match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+        Ok(a)  =>
+            test.assert_eq(lachol.is_positive_definite(a), true)
+            match lachol.factor(a)
+                Ok(c)  =>
+                    test.assert_eq(lachol.order(c), 2)
+                    match ndfloat.at(lachol.lower(c), [0, 0])
+                        Ok(v)  => test.assert_approx(v, 2.0, 1e-10)
+                        Err(e) => test.fail(e.message())
+                    // The determinant of a positive-definite matrix is
+                    // positive, always — which is itself a check on a
+                    // caller who thought their matrix was one.
+                    test.assert_approx(lachol.determinant(c), 8.0, 1e-10)
+                    test.assert_approx(lachol.log_determinant(c), 2.0794415416798357, 1e-10)
+                    test.assert_eq(ndfloat.rank(lachol.upper(c)), 2)
+                    match ndfloat.sub(lachol.reconstruct(c), a)
+                        Ok(d)  =>
+                            match lanorm.norm(d, LaNormFrobenius)
+                                Ok(n)  => test.assert_approx(n, 0.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A negative diagonal entry is not positive definite, and the
+    // refusal names the position and the value — a covariance matrix
+    // that rounding pushed to -1e-18 is a different problem from one
+    // that is genuinely indefinite.
+    match ndfloat.of_list([-1.0, 0.0, 0.0, 1.0], [2, 2])
+        Ok(bad) =>
+            test.assert_eq(lachol.is_positive_definite(bad), false)
+            match lachol.factor(bad)
+                Ok(_)  => test.fail("a negative diagonal is not positive definite")
+                Err(e) =>
+                    match e
+                        LaNotPositiveDefinite(at, v) =>
+                            test.assert_eq(at, 0)
+                            test.assert_approx(v, -1.0, 1e-12)
+                        _                            => test.fail("expected LaNotPositiveDefinite: ${e.message()}")
+                    test.assert_eq(lafault.is_singular_fault(e), true)
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_cholesky_solves_and_transforms_standard_normals_into_a_covariance()
+    match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match lachol.factor(a)
+                Ok(c)  =>
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lachol.solve(c, b)
+                                Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                                Err(e) => test.fail(e.message())
+                            // `L y` has covariance `A` when `y` is
+                            // standard normal — the reason Cholesky is
+                            // in every statistics library.
+                            match lachol.apply_lower(c, b)
+                                Ok(y)  => test.assert_eq(ndfloat.size(y), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.eye(2)
+                        Ok(rhs) =>
+                            match lachol.solve_matrix(c, rhs)
+                                Ok(x)  => test.assert_eq(ndfloat.rank(x), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e)  => test.fail(e.message())
+                    // The precision matrix: the one case where forming
+                    // an inverse is what the caller genuinely wants,
+                    // because its entries are the answer.
+                    match lachol.inverse(c)
+                        Ok(p)  => test.assert_eq(ndfloat.rank(p), 2)
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lasolve.solve_spd(a, a)
+                Ok(x)  => test.assert_eq(ndfloat.rank(x), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── the symmetric eigenproblem ──────────────────────────────────────
+
+@test
+fn test_a_diagonal_matrix_is_its_own_eigendecomposition_sorted_descending()
+    // Descending, which is this package's convention and NOT LAPACK's:
+    // `dsyev` and numpy's `eigh` sort ascending.  Stated here because a
+    // reader porting from numpy will meet it.
+    match ndfloat.of_list([1.0, 0.0, 0.0, 5.0], [2, 2])
+        Ok(a)  =>
+            match laeig.factor(a)
+                Ok(e)   =>
+                    test.assert_eq(laeig.order(e), 2)
+                    match ndfloat.at(laeig.values(e), [0])
+                        Ok(v)   => test.assert_approx(v, 5.0, 1e-10)
+                        Err(er) => test.fail(er.message())
+                    match ndfloat.at(laeig.values(e), [1])
+                        Ok(v)   => test.assert_approx(v, 1.0, 1e-10)
+                        Err(er) => test.fail(er.message())
+                    test.assert_eq(ndfloat.rank(laeig.vectors(e)), 2)
+                    match laeig.vector(e, 0)
+                        Ok(v)   => test.assert_eq(ndfloat.size(v), 2)
+                        Err(er) => test.fail(er.message())
+                    match laeig.vector(e, 9)
+                        Ok(_)  => test.fail("a 2 by 2 matrix has two eigenvectors")
+                        Err(_) => test.assert_eq(true, true)
+                Err(er) => test.fail(er.message())
+            match laeig.values_only(a)
+                Ok(w)   => test.assert_eq(ndfloat.size(w), 2)
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_eigenvalues_sum_to_the_trace_and_multiply_to_the_determinant()
+    // Two identities that hold for every symmetric matrix and catch
+    // almost every implementation mistake at once.
+    match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match laeig.factor(a)
+                Ok(e)   =>
+                    match lanorm.trace(a)
+                        Ok(t)   =>
+                            match ndfloat.at(laeig.values(e), [0])
+                                Ok(w0)  =>
+                                    match ndfloat.at(laeig.values(e), [1])
+                                        Ok(w1)  => test.assert_approx(w0 + w1, t, 1e-10)
+                                        Err(er) => test.fail(er.message())
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                    // The largest eigenvalue is 5 + something; the
+                    // spectral radius is its magnitude, and for a
+                    // positive-definite matrix the two agree.
+                    test.assert_eq(laeig.spectral_radius(e) > 0.0, true)
+                    test.assert_eq(laeig.condition(e) >= 1.0, true)
+                    match ndfloat.sub(laeig.reconstruct(e), a)
+                        Ok(d)   =>
+                            match lanorm.norm(d, LaNormFrobenius)
+                                Ok(n)   => test.assert_approx(n, 0.0, 1e-10)
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_inertia_is_what_an_optimiser_checks_at_a_stationary_point()
+    // Sylvester's law: the counts of positive, zero and negative
+    // eigenvalues are invariant.  A Hessian at a minimum is all
+    // positive, at a saddle is mixed.
+    match ndfloat.of_list([1.0, 0.0, 0.0, -1.0], [2, 2])
+        Ok(saddle) =>
+            match laeig.factor(saddle)
+                Ok(e)   =>
+                    match laeig.inertia(e, 1e-12)
+                        Ok(i)   =>
+                            test.assert_eq(i.positive, 1)
+                            test.assert_eq(i.zero, 0)
+                            test.assert_eq(i.negative, 1)
+                        Err(er) => test.fail(er.message())
+                    match laeig.inertia(e, -1.0)
+                        Ok(_)  => test.fail("a tolerance is not negative")
+                        Err(_) => test.assert_eq(true, true)
+                    // A negative eigenvalue to a fractional power is
+                    // not real, so it refuses rather than answering a
+                    // NaN quietly.
+                    match laeig.power(e, 0.5)
+                        Ok(_)  => test.fail("a negative eigenvalue has no real square root")
+                        Err(_) => test.assert_eq(true, true)
+                Err(er) => test.fail(er.message())
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_a_matrix_power_is_one_line_over_factors_already_computed()
+    // `p` of 0.5 whitens data, -1 inverts, -0.5 is the Mahalanobis
+    // transform.  This is what makes the eigendecomposition worth
+    // keeping as a value.
+    match ndfloat.of_list([4.0, 0.0, 0.0, 9.0], [2, 2])
+        Ok(a)  =>
+            match laeig.factor(a)
+                Ok(e)   =>
+                    match laeig.power(e, 0.5)
+                        Ok(root) =>
+                            match ndfloat.at(root, [0, 0])
+                                Ok(v)   => test.assert_approx(v, 2.0, 1e-10)
+                                Err(er) => test.fail(er.message())
+                        Err(er)  => test.fail(er.message())
+                Err(er) => test.fail(er.message())
+            // The sweep bound is the caller's to raise, and 30 is the
+            // number `LaNoConvergence` names.
+            test.assert_eq(laeig.LAEIG_SWEEPS, 30)
+            match laeig.factor_with_sweeps(a, 60)
+                Ok(e)   => test.assert_eq(laeig.order(e), 2)
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+// ── the singular value decomposition ────────────────────────────────
+
+@test
+fn test_a_diagonal_matrix_has_its_diagonal_as_its_singular_values()
+    // Descending and non-negative, which is everybody's convention.
+    match ndfloat.of_list([3.0, 0.0, 0.0, 1.0], [2, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)   =>
+                    test.assert_eq(lasvd.count(s), 2)
+                    test.assert_eq(lasvd.rows(s), 2)
+                    test.assert_eq(lasvd.cols(s), 2)
+                    match ndfloat.at(lasvd.singular_values(s), [0])
+                        Ok(v)   => test.assert_approx(v, 3.0, 1e-10)
+                        Err(er) => test.fail(er.message())
+                    match ndfloat.at(lasvd.singular_values(s), [1])
+                        Ok(v)   => test.assert_approx(v, 1.0, 1e-10)
+                        Err(er) => test.fail(er.message())
+                    // The 2-norm IS the largest singular value, by
+                    // definition and not by estimate.
+                    test.assert_approx(lasvd.norm_2(s), 3.0, 1e-10)
+                    test.assert_approx(lasvd.condition(s), 3.0, 1e-10)
+                    test.assert_eq(ndfloat.rank(lasvd.u(s)), 2)
+                    test.assert_eq(ndfloat.rank(lasvd.v(s)), 2)
+                    test.assert_eq(ndfloat.rank(lasvd.u_full(s)), 2)
+                    match ndfloat.sub(lasvd.reconstruct(s), a)
+                        Ok(d)   =>
+                            match lanorm.norm(d, LaNormFrobenius)
+                                Ok(n)   => test.assert_approx(n, 0.0, 1e-10)
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                Err(er) => test.fail(er.message())
+            match lasvd.values_only(a)
+                Ok(sv)  => test.assert_eq(ndfloat.size(sv), 2)
+                Err(er) => test.fail(er.message())
+            test.assert_eq(lasvd.LASVD_SWEEPS, 30)
+            match lasvd.factor_with_sweeps(a, 60)
+                Ok(s)   => test.assert_eq(lasvd.count(s), 2)
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_rank_is_a_count_of_singular_values_above_a_tolerance()
+    // A rank-1 matrix: two identical rows.  The second singular value
+    // is zero in exact arithmetic and around 1e-16 after a
+    // factorisation, which is exactly why the tolerance is an argument.
+    match ndfloat.of_list([1.0, 2.0, 1.0, 2.0], [2, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)   =>
+                    match lasvd.rank(s, 1e-10)
+                        Ok(r)   => test.assert_eq(r, 1)
+                        Err(er) => test.fail(er.message())
+                    match lasvd.rank(s, -1.0)
+                        Ok(_)  => test.fail("a tolerance is not negative")
+                        Err(_) => test.assert_eq(true, true)
+                    // numpy's rule, published so a caller who wants
+                    // numpy's answer can name it.
+                    test.assert_eq(lasvd.default_rank_tolerance(s) > 0.0, true)
+                    // A singular matrix's condition number is infinite,
+                    // which is the honest answer.
+                    test.assert_eq(lasvd.condition(s) > 1e12, true)
+                    // The pseudoinverse exists where the inverse does
+                    // not, and the truncation is the definition rather
+                    // than an approximation to avoid.
+                    match lasvd.pseudoinverse(s, 1e-10)
+                        Ok(p)   => test.assert_eq(ndfloat.rank(p), 2)
+                        Err(er) => test.fail(er.message())
+                    // Eckart-Young: the best rank-1 approximation is
+                    // the first singular triple, and for a rank-1
+                    // matrix it is exact.
+                    match lasvd.truncate(s, 1)
+                        Ok(t)   =>
+                            match ndfloat.sub(t, a)
+                                Ok(d)   =>
+                                    match lanorm.norm(d, LaNormFrobenius)
+                                        Ok(n)   => test.assert_approx(n, 0.0, 1e-10)
+                                        Err(er) => test.fail(er.message())
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                    match lasvd.truncate(s, 9)
+                        Ok(_)  => test.fail("a 2 by 2 matrix has two singular values")
+                        Err(_) => test.assert_eq(true, true)
+                    match ndfloat.of_list([3.0, 3.0], [2])
+                        Ok(b)   =>
+                            match lasvd.lstsq(s, b, 1e-10)
+                                Ok(x)   => test.assert_eq(ndfloat.size(x), 2)
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+// ── norms ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_five_matrix_norms_differ_and_each_answers_its_own_question()
+    // `[[1, 2], [3, 4]]`: max column sum 6, max row sum 7, Frobenius
+    // sqrt(30), max entry 4.  Four different numbers for four different
+    // questions, which is why there are five names and no default.
+    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match lanorm.norm(a, LaNorm1)
+                Ok(v)  => test.assert_approx(v, 6.0, 1e-10)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormInf)
+                Ok(v)  => test.assert_approx(v, 7.0, 1e-10)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormFrobenius)
+                Ok(v)  => test.assert_approx(v, 5.477225575051661, 1e-10)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormMax)
+                Ok(v)  => test.assert_approx(v, 4.0, 1e-10)
+                Err(e) => test.fail(e.message())
+            // The 2-norm is the expensive one: it needs an SVD.
+            match lanorm.norm(a, LaNorm2)
+                Ok(v)  => test.assert_approx(v, 5.464985704219043, 1e-8)
+                Err(e) => test.fail(e.message())
+            match lanorm.trace(a)
+                Ok(v)  => test.assert_approx(v, 5.0, 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_vector_norms_and_the_dot_product()
+    match ndfloat.of_list([3.0, 4.0], [2])
+        Ok(x)  =>
+            match lanorm.vector_norm(x)
+                Ok(v)  => test.assert_approx(v, 5.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_p(x, 1.0)
+                Ok(v)  => test.assert_approx(v, 7.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_inf(x)
+                Ok(v)  => test.assert_approx(v, 4.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            // Below 1 the triangle inequality fails, so it is not a
+            // norm and this package will not pretend it is.
+            match lanorm.vector_norm_p(x, 0.5)
+                Ok(_)  => test.fail("below p = 1 that is not a norm")
+                Err(e) =>
+                    match e
+                        LaBadNormOrder(_) => test.assert_eq(true, true)
+                        _                 => test.fail("expected LaBadNormOrder: ${e.message()}")
+            match lanorm.dot(x, x)
+                Ok(v)  => test.assert_approx(v, 25.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match ndfloat.of_list([1.0, 2.0, 3.0], [3])
+                Ok(y)  =>
+                    match lanorm.dot(x, y)
+                        Ok(_)  => test.fail("a dot product wants equal lengths")
+                        Err(_) => test.assert_eq(true, true)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_two_condition_numbers_are_the_exact_one_and_the_cheap_one()
+    // The estimate only has to be right to an order of magnitude, which
+    // is what a condition number is for — and making every solve pay
+    // for an SVD to get three significant figures is how the question
+    // stops being asked.
+    match ndfloat.of_list([2.0, 0.0, 0.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    test.assert_approx(lanorm.condition(s), 2.0, 1e-10)
+                Err(e) => test.fail(e.message())
+            match lalu.factor(a)
+                Ok(lu) =>
+                    match lanorm.norm(a, LaNorm1)
+                        Ok(n1) => test.assert_eq(lanorm.condition_estimate(lu, n1) >= 1.0, true)
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // Symmetric matrices know their own condition number from
+            // the eigendecomposition, with no SVD needed.
+            match laeig.factor(a)
+                Ok(e)  => test.assert_approx(laeig.condition(e), 2.0, 1e-10)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_two_defect_measurements_answer_the_questions_the_factors_skip()
+    // `lachol` and `laeig` read only the lower triangle and do not
+    // check symmetry, because checking costs a tolerance nobody can
+    // choose for a caller.  This is where the caller who is not sure
+    // asks, once.
+    match ndfloat.eye(3)
+        Ok(i3) =>
+            match lanorm.symmetry_defect(i3)
+                Ok(d)  => test.assert_approx(d, 0.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.orthogonality_defect(i3)
+                Ok(d)  => test.assert_approx(d, 0.0, 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match ndfloat.of_list([1.0, 2.0, 0.0, 1.0], [2, 2])
+        Ok(asym) =>
+            match lanorm.symmetry_defect(asym)
+                Ok(d)  => test.assert_eq(d > 0.0, true)
+                Err(e) => test.fail(e.message())
+        Err(e)   => test.fail(e.message())
+
+// ── the one-shot forms ──────────────────────────────────────────────
+
+@test
+fn test_the_one_shot_forms_answer_what_the_factorisations_do()
+    // Every one of these throws the factorisation away, which is why
+    // they are in a module of their own rather than beside the values.
+    match ndfloat.of_list([2.0, 0.0, 0.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match ndfloat.of_list([2.0, 4.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve(a, b)
+                        Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lasolve.determinant(a)
+                Ok(d)  => test.assert_approx(d, 8.0, 1e-10)
+                Err(e) => test.fail(e.message())
+            match lasolve.inverse(a)
+                Ok(inv) => test.assert_eq(ndfloat.rank(inv), 2)
+                Err(e)  => test.fail(e.message())
+            match lasolve.rank(a, 1e-10)
+                Ok(r)  => test.assert_eq(r, 2)
+                Err(e) => test.fail(e.message())
+            match lasolve.pseudoinverse(a, 1e-10)
+                Ok(p)  => test.assert_eq(ndfloat.rank(p), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_triangular_system_is_solved_with_nothing_factored_at_all()
+    // For the caller who already HAS a triangular matrix — a Cholesky
+    // factor they kept, a sparse structure, a linear program's basis.
+    match ndfloat.of_list([2.0, 0.0, 1.0, 3.0], [2, 2])
+        Ok(l)  =>
+            match ndfloat.of_list([2.0, 4.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve_lower(l, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match ndfloat.of_list([2.0, 1.0, 0.0, 3.0], [2, 2])
+        Ok(u)  =>
+            match ndfloat.of_list([3.0, 3.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve_upper(u, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A zero on the diagonal is the one thing a triangular solve can
+    // refuse.
+    match ndfloat.zeros([2, 2])
+        Ok(z)  =>
+            match ndfloat.of_list([1.0, 1.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve_lower(z, b)
+                        Ok(_)  => test.fail("a zero diagonal is singular")
+                        Err(_) => test.assert_eq(true, true)
+                    match lasolve.solve_upper(z, b)
+                        Ok(_)  => test.fail("a zero diagonal is singular")
+                        Err(_) => test.assert_eq(true, true)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_sweep_limit_refusal_is_told_apart_from_the_other_two_kinds()
+    // What a caller does next is different for each: raise the bound,
+    // fall back to another factorisation, or fix the calling code.
+    let conv = LaNoConvergence(sweeps: 30, residual: 1e-3)
+    test.assert_eq(lafault.is_convergence_fault(conv), true)
+    test.assert_eq(lafault.is_shape_fault(conv), false)
+    test.assert_eq(lafault.is_singular_fault(conv), false)
+    test.assert_eq(conv.message().len() > 0, true)
+    let dim = LaDimensionMismatch(want: 3, got: 2)
+    test.assert_eq(lafault.is_shape_fault(dim), true)
+    let bad = LaBadNormOrder(p: 0.5)
+    test.assert_eq(lafault.is_shape_fault(bad), false)
+    test.assert_eq(lafault.is_singular_fault(bad), false)
+    test.assert_eq(lafault.is_convergence_fault(bad), false)

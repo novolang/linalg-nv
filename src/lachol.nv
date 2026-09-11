@@ -1,0 +1,171 @@
+// lachol — the Cholesky factorisation, which is the fast path for the
+// matrices statistics and optimisation actually produce.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  `A = L Lᵀ` for a symmetric positive-definite `A`, with
+// `L` lower triangular and positive on its diagonal.  Half the work of
+// LU (`n³/6` against `n³/3`), half the storage, no pivoting needed, and
+// unconditionally stable — a positive-definite matrix has no small
+// pivots to find.
+//
+// WHY IT MATTERS THAT THE MATRIX IS A COVARIANCE.  Every covariance
+// matrix, every Gram matrix `AᵀA`, every Hessian at a minimum and every
+// kernel matrix is symmetric positive-definite by construction, which
+// is most of the linear algebra a statistical model does.  So this is
+// not a special case; it is the common one, and LU is the fallback.
+//
+// LAPACK: `dpotrf` factors, `dpotrs` solves, `dpotri` inverts,
+// `dpocon` estimates the condition number.
+//
+// THE REFUSAL IS A FEATURE AND IS USED AS ONE.  `factor` fails exactly
+// when the matrix is not positive definite, and that failure is the
+// standard TEST for positive definiteness — cheaper and more reliable
+// than computing eigenvalues and checking their signs.  So
+// `LaNotPositiveDefinite` carries the diagonal position and the value
+// the square root was asked for: a covariance matrix that rounding has
+// pushed to `-1e-18` at position 7 is a different problem from one that
+// is genuinely indefinite at position 0, and the caller can tell which
+// from the number.  `is_positive_definite` is the predicate form for a
+// caller who only wants the question answered.
+//
+// ONLY THE LOWER TRIANGLE IS READ.  The upper triangle of the input is
+// never touched, which is LAPACK's `uplo = 'L'` convention.  A matrix
+// that is not symmetric is therefore NOT refused — its lower triangle
+// is taken as the whole story.  That is deliberate: checking symmetry
+// costs `n²` comparisons against a tolerance nobody can choose for the
+// caller, and a caller who built a covariance matrix knows it is
+// symmetric.  `lanorm.symmetry_defect` is there for the one who is not
+// sure.
+
+use ndfloat
+
+// LaChol is the Cholesky factorisation of a symmetric positive-definite
+// matrix.
+//
+// ```novo
+// use ndfloat
+// use lachol
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lachol.factor(a)
+//                 Ok(c)  => println("${lachol.order(c)}")   // 3
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct LaChol
+    // `L`, lower triangular with a positive diagonal, `n x n`.  The
+    // strict upper triangle is zero — stored rather than packed,
+    // because half a matrix of zeros is cheap at the sizes this is for
+    // and an `NdFloat` a caller can hand straight to a multiply is
+    // worth more than the memory.
+    lower: NdFloat
+    // How many rows the factored matrix had.
+    n: Int
+
+// The Cholesky factorisation.
+//
+// LAPACK `dpotrf` with `uplo = 'L'`: only the lower triangle of `a` is
+// read.  `LaNotMatrix`, `LaNotSquare`, `LaEmptyMatrix` as usual, and
+// `LaNotPositiveDefinite` with the position and the value when a
+// diagonal entry is not positive after the elimination so far.
+pub fn factor(a: NdFloat) -> Result<LaChol, LaFault> []
+    todo("linalg-nv.lachol.factor")
+
+// Whether the matrix is symmetric positive-definite, by trying to
+// factor it.
+//
+// The standard test, and cheaper and more reliable than computing
+// eigenvalues and checking their signs.  Only the lower triangle is
+// read, so this answers "is the lower triangle the lower triangle of an
+// SPD matrix" — `lanorm.symmetry_defect` is the other half of the
+// question.
+//
+// ```novo
+// use ndfloat
+// use lachol
+//
+// fn main() [io]
+//     match ndfloat.eye(2)
+//         Ok(a)  => println("${lachol.is_positive_definite(a)}")   // true
+//         Err(e) => println(e.message())
+// ```
+pub fn is_positive_definite(a: NdFloat) -> Bool []
+    todo("linalg-nv.lachol.is_positive_definite")
+
+// How many rows the factored matrix had.
+pub fn order(c: LaChol) -> Int []
+    todo("linalg-nv.lachol.order")
+
+// The lower-triangular factor `L`.
+pub fn lower(c: LaChol) -> NdFloat []
+    todo("linalg-nv.lachol.lower")
+
+// The upper-triangular factor `Lᵀ`, which is the same numbers
+// transposed.
+//
+// Here because half the literature writes the factorisation as
+// `A = Uᵀ U` and a reader translating a formula should not have to
+// transpose by hand and wonder whether they got it right.
+pub fn upper(c: LaChol) -> NdFloat []
+    todo("linalg-nv.lachol.upper")
+
+// `x` such that `A x = b`.
+//
+// LAPACK `dpotrs`.  Forward substitution through `L`, back
+// substitution through `Lᵀ`, at `n²`.
+pub fn solve(c: LaChol, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lachol.solve")
+
+// `X` such that `A X = B`, for several right-hand sides at once.
+pub fn solve_matrix(c: LaChol, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lachol.solve_matrix")
+
+// The inverse of the factored matrix.
+//
+// LAPACK `dpotri`.  The same warning `lalu.inverse` carries — to solve
+// a system, use `solve` — with one genuine exception, which is why this
+// one gets used more than that one: the inverse of a covariance matrix
+// is the precision matrix, and its ENTRIES are the thing a
+// statistical model reports.
+pub fn inverse(c: LaChol) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lachol.inverse")
+
+// The determinant: the square of the product of `L`'s diagonal.
+//
+// Always positive, because a positive-definite matrix's determinant is
+// — which is itself a useful check on a caller who thought their matrix
+// was one.
+pub fn determinant(c: LaChol) -> Float []
+    todo("linalg-nv.lachol.determinant")
+
+// The natural logarithm of the determinant: twice the sum of the
+// logarithms of `L`'s diagonal.
+//
+// The call a Gaussian log-likelihood makes, and the reason Cholesky is
+// in every statistics library: `log det Σ` for a 500 x 500 covariance
+// matrix is a sum of 500 logarithms here and an overflow every other
+// way.  No sign is needed, because there is no sign.
+pub fn log_determinant(c: LaChol) -> Float []
+    todo("linalg-nv.lachol.log_determinant")
+
+// `L y` for a vector `y` — the transform that turns standard normal
+// samples into samples from a covariance.
+//
+// The other reason Cholesky is in every statistics library: if `y` is
+// a vector of independent standard normals then `L y` has covariance
+// `A`.  It is a triangular multiply, it is three lines, and having it
+// named here is what stops it being written slightly differently in
+// four places.
+pub fn apply_lower(c: LaChol, y: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lachol.apply_lower")
+
+// The product `L Lᵀ` — the original matrix's lower triangle,
+// reconstructed, with the upper triangle filled in symmetrically.
+//
+// The round trip every decomposition owes.
+pub fn reconstruct(c: LaChol) -> NdFloat []
+    todo("linalg-nv.lachol.reconstruct")

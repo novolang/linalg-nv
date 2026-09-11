@@ -1,0 +1,202 @@
+// laqr — the QR factorisation by Householder reflections, and the
+// least-squares solve that is what it is for.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  `A = Q R` for an `m x n` matrix with `m >= n`: `Q` has
+// orthonormal columns and `R` is upper triangular.
+//
+// HOUSEHOLDER, NOT GRAM-SCHMIDT, and the reason is the only thing
+// anybody needs to remember about QR.  Classical Gram-Schmidt loses
+// orthogonality catastrophically on an ill-conditioned matrix — the
+// computed `Q` can fail `QᵀQ = I` by an amount proportional to the
+// condition number SQUARED — while Householder reflections are
+// backward stable and lose it by an amount proportional to the machine
+// epsilon alone.  Modified Gram-Schmidt is in between and is still
+// worse.  This is not a preference; it is the difference between a
+// least-squares fit that is right and one that is quietly wrong on
+// exactly the data that made someone reach for a least-squares fit.
+//
+// LAPACK: `dgeqrf` factors, `dorgqr` forms `Q`, `dormqr` applies it
+// without forming it, `dgels` solves the least-squares problem.
+//
+// `Q` IS NOT STORED.  `dgeqrf` leaves the reflectors in the lower
+// triangle of the input and a scalar per column beside them, and that
+// IS the factorisation — forming the `m x m` `Q` costs another `m²n`
+// and is almost never wanted, because every use of `Q` is a
+// multiplication by it.  So `LaQr` holds the reflectors, `apply_q` and
+// `apply_q_transpose` multiply without forming anything, and `q` and
+// `q_thin` are there for the caller who genuinely wants the matrix.
+//
+// THE THIN AND THE FULL `Q` ARE BOTH HERE because they are different
+// objects and the difference has bitten everybody once: the full `Q` is
+// `m x m` and orthogonal, the thin one is `m x n` with orthonormal
+// COLUMNS and is not square.  `A = Q_thin R_thin` is the economy
+// factorisation and is what a least-squares fit uses; the full `Q`'s
+// extra columns span the residual space and are what an orthogonal
+// complement needs.
+
+use ndfloat
+
+// LaQr is the QR factorisation of an `m x n` matrix with `m >= n`,
+// stored as Householder reflectors rather than as `Q`.
+//
+// The fields are public because a reader checking this against
+// `dgeqrf`'s documented output needs to see the layout.
+//
+// ```novo
+// use ndfloat
+// use laqr
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match laqr.factor(a)
+//                 Ok(qr) => println("${laqr.rows(qr)}")   // 3
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct LaQr
+    // `R` in the upper triangle and the Householder vectors below it,
+    // LAPACK's packing: `m x n`.
+    packed: NdFloat
+    // One scalar per reflector — LAPACK's `tau`, the factor that turns
+    // a Householder vector into the reflection `I - tau v vᵀ`.
+    tau: [Float]
+    // How many rows the factored matrix had.
+    m: Int
+    // How many columns.
+    n: Int
+
+// The QR factorisation by Householder reflections.
+//
+// LAPACK `dgeqrf`.  `LaNotMatrix` for an array that is not rank 2,
+// `LaEmptyMatrix` for a zero dimension, `LaUnderdetermined` when there
+// are fewer rows than columns — the wide case has a QR of its own
+// (`dgelqf`, the LQ factorisation) and this package does not carry it,
+// which the README names as a missing row rather than leaving as a
+// surprise.
+//
+// It does NOT refuse a rank-deficient matrix: Householder QR without
+// column pivoting factors one perfectly well and leaves a zero on
+// `R`'s diagonal.  `lasvd` is what detects rank; `lstsq` says what it
+// does when it meets one.
+pub fn factor(a: NdFloat) -> Result<LaQr, LaFault> []
+    todo("linalg-nv.laqr.factor")
+
+// How many rows the factored matrix had.
+pub fn rows(qr: LaQr) -> Int []
+    todo("linalg-nv.laqr.rows")
+
+// How many columns.
+pub fn cols(qr: LaQr) -> Int []
+    todo("linalg-nv.laqr.cols")
+
+// The full `m x m` orthogonal `Q`.
+//
+// LAPACK `dorgqr`.  Costs `m²n` and is the call to avoid unless the
+// matrix itself is wanted — `apply_q` multiplies by it for `mn`.  The
+// columns beyond the first `n` span the orthogonal complement of `A`'s
+// column space, which is what makes the full form worth having at all.
+pub fn q(qr: LaQr) -> NdFloat []
+    todo("linalg-nv.laqr.q")
+
+// The thin `m x n` `Q`: the first `n` columns, orthonormal, not square.
+//
+// The economy factorisation, and the one a least-squares fit uses.  See
+// the module comment for why both forms are published.
+pub fn q_thin(qr: LaQr) -> NdFloat []
+    todo("linalg-nv.laqr.q_thin")
+
+// The upper-triangular `R`, as an `n x n` matrix.
+//
+// The rows below the first `n` of the full `m x n` `R` are zero by
+// construction, so this is the thin form and the only one with
+// anything in it.
+pub fn r(qr: LaQr) -> NdFloat []
+    todo("linalg-nv.laqr.r")
+
+// `Q x` for a vector or `Q X` for a matrix, without forming `Q`.
+//
+// LAPACK `dormqr`.  Applies the reflectors in order, at `mn` for a
+// vector against `m²n` to form the matrix — which is why this is the
+// call and `q` is the escape hatch.
+//
+// `LaDimensionMismatch` when the operand's leading dimension is not
+// `m`.
+pub fn apply_q(qr: LaQr, x: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laqr.apply_q")
+
+// `Qᵀ x`, without forming `Q`.
+//
+// The direction a least-squares solve actually uses: `min ||Ax - b||`
+// is `R x = Qᵀ b` back-substituted, and `Qᵀ b` is this call.
+pub fn apply_q_transpose(qr: LaQr, x: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laqr.apply_q_transpose")
+
+// `x` minimising `||A x - b||₂`, for a vector `b`.
+//
+// LAPACK `dgels`.  `Qᵀ b`, then back-substitution through `R` — which
+// is the numerically sound way to fit a line, a polynomial or a
+// regression, and is emphatically not the normal equations.
+//
+// **THE NORMAL EQUATIONS ARE NOT WHAT THIS DOES, AND THAT IS THE
+// POINT.**  Solving `AᵀA x = Aᵀb` is the formula every textbook derives
+// and it squares the condition number: a matrix conditioned at 10⁸ —
+// which a cubic fit over an unscaled x axis reaches easily — loses
+// every digit through `AᵀA` and keeps half of them through QR.  A
+// package that offered `normal_equations` beside this would be offering
+// a footgun with a shorter name.
+//
+// `LaSingular` when `R` has a zero on its diagonal — a rank-deficient
+// system has infinitely many least-squares solutions and this routine
+// picks none of them.  `lasvd.lstsq` is the one that answers the
+// minimum-norm solution, and the README says which to reach for.
+//
+// ```novo
+// use ndfloat
+// use laqr
+//
+// fn main() [io]
+//     match ndfloat.eye(2)
+//         Ok(a) =>
+//             match laqr.factor(a)
+//                 Ok(qr) =>
+//                     match ndfloat.of_list([1.0, 2.0], [2])
+//                         Ok(b) =>
+//                             match laqr.lstsq(qr, b)
+//                                 Ok(x)  => println("${ndfloat.size(x)}")   // 2
+//                                 Err(e) => println(e.message())
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn lstsq(qr: LaQr, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laqr.lstsq")
+
+// The residual norm `||A x - b||₂` at the least-squares solution,
+// without forming `A x`.
+//
+// It falls out of the factorisation for free: the norm of the last
+// `m - n` entries of `Qᵀ b` IS the residual, so a caller who wants to
+// know how good the fit was should ask this rather than multiply back.
+pub fn residual_norm(qr: LaQr, b: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.laqr.residual_norm")
+
+// `x` such that `R x = y`, back-substituted.
+//
+// The second half of every solve above, published because a caller with
+// their own `Qᵀ b` — from `apply_q_transpose`, or from an incremental
+// update — should not have to write back-substitution again.
+//
+// `LaSingular` when `R` has a zero on its diagonal.
+pub fn solve_r(qr: LaQr, y: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laqr.solve_r")
+
+// The product `Q R` — the original matrix, reconstructed.
+//
+// The round trip every decomposition owes.  `m²n`, for tests and for a
+// reader checking by hand.
+pub fn reconstruct(qr: LaQr) -> NdFloat []
+    todo("linalg-nv.laqr.reconstruct")

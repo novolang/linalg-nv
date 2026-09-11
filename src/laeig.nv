@@ -1,0 +1,205 @@
+// laeig — the symmetric eigendecomposition, by cyclic Jacobi.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// SYMMETRIC ONLY, AND THAT IS A DESIGN DECISION RATHER THAN A GAP.  The
+// general eigenproblem has complex eigenvalues even for a real matrix,
+// so its API needs a complex type, complex eigenvectors, a left and a
+// right eigenvector convention and a Schur form — and novo-lang has no
+// complex type, so all of that would be pairs of arrays with a
+// convention written in a comment.  The symmetric case has REAL
+// eigenvalues and an ORTHOGONAL eigenvector matrix, which is what the
+// notebook subset needs: principal component analysis, a covariance's
+// spectrum, a quadratic form's signature, a graph's Laplacian, a
+// Hessian's curvature.  Every one of those is symmetric by
+// construction.  The general case is named as a missing row in the
+// README, not smuggled in.
+//
+// JACOBI, AND WHY THIS PACKAGE PICKS IT OVER QR-SHIFT.  Both are in
+// LAPACK — `dsyev` is the tridiagonal QR-shift path and `dsyevj` the
+// Jacobi one — and the trade is stated plainly because the plan asked
+// which and the answer is not obvious:
+//
+//   QR-SHIFT is faster: reduce to tridiagonal form with Householder
+//   reflections, then iterate.  Roughly `(4/3)n³` against Jacobi's
+//   `(10-20)n³` depending on how many sweeps converge.
+//
+//   JACOBI is more ACCURATE for the case that matters here.  It
+//   computes the small eigenvalues of a graded matrix to high RELATIVE
+//   accuracy, where the tridiagonal reduction has already lost them to
+//   the absolute error of the largest — and a covariance matrix whose
+//   eigenvalues span ten orders of magnitude is exactly the matrix a
+//   principal-component analysis is run on.  It is also far simpler:
+//   one rotation, applied in a loop, with no deflation, no shift
+//   strategy and no tridiagonal form.
+//
+// So: Jacobi, because an interface package's first implementation
+// should be the one whose correctness a reader can check, and because
+// accuracy on graded matrices is worth more to this package's consumers
+// than a constant factor of five.  **If a benchmark later says the
+// factor matters, the QR-shift path goes BEHIND these same signatures**
+// — `LaEigen` holds values and vectors and says nothing about how they
+// were found, which is what makes that change a non-event.
+//
+// SORTED DESCENDING, ALWAYS.  LAPACK's `dsyev` sorts ascending and
+// numpy's `eigh` follows it; scipy's `svd` sorts singular values
+// descending and everybody's PCA wants the largest first.  Sorting
+// descending here is a decision: it matches `lasvd`, it matches what a
+// caller does next, and it is stated rather than left to the
+// implementation.  `README` names it under the conventions.
+
+use ndfloat
+
+// The default sweep limit for the Jacobi iteration: 30.
+//
+// A sweep is one pass over every off-diagonal pair.  Cyclic Jacobi
+// converges quadratically once the off-diagonal norm is small, and
+// practical matrices finish in six to ten; 30 is the bound at which
+// something is wrong rather than slow.  Published because
+// `LaNoConvergence` names it and a caller raising it should know what
+// they are raising from.
+pub const LAEIG_SWEEPS = 30
+
+// LaEigen is a symmetric matrix's eigenvalues and eigenvectors.
+//
+// `A = V diag(w) Vᵀ` with `V` orthogonal and `w` real, sorted
+// descending.
+//
+// ```novo
+// use ndfloat
+// use laeig
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match laeig.factor(a)
+//                 Ok(e)  => println("${laeig.order(e)}")   // 3
+//                 Err(er) => println(er.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct LaEigen
+    // The eigenvalues, descending.  A rank-1 `NdFloat` of length `n`.
+    values: NdFloat
+    // The eigenvectors as the COLUMNS of an `n x n` orthogonal matrix,
+    // in the same order as `values`.
+    //
+    // Columns and not rows, which is the convention LAPACK, numpy and
+    // every textbook use — and which is worth stating because a caller
+    // who transposes it gets an answer that looks plausible and is
+    // wrong.  `vector(e, k)` is the accessor that removes the question.
+    vectors: NdFloat
+    // How many rows the factored matrix had.
+    n: Int
+
+// The symmetric eigendecomposition, with the default sweep limit.
+//
+// LAPACK `dsyevj`.  Only the lower triangle is read, for the reason
+// `lachol` gives.  `LaNotMatrix`, `LaNotSquare`, `LaEmptyMatrix`, and
+// `LaNoConvergence` with the limit and the off-diagonal norm reached.
+pub fn factor(a: NdFloat) -> Result<LaEigen, LaFault> []
+    todo("linalg-nv.laeig.factor")
+
+// The symmetric eigendecomposition with a sweep limit of the caller's
+// choosing.
+//
+// The escape hatch for the matrix that needed 31 sweeps, and the way a
+// caller who met `LaNoConvergence` retries.  A limit below 1 is
+// `LaNoConvergence` immediately rather than a refusal of its own, since
+// zero sweeps is a legitimate thing to ask for and a legitimate thing
+// to fail at.
+pub fn factor_with_sweeps(a: NdFloat, sweeps: Int) -> Result<LaEigen, LaFault> []
+    todo("linalg-nv.laeig.factor_with_sweeps")
+
+// Only the eigenvalues, without accumulating the eigenvectors.
+//
+// LAPACK's `jobz = 'N'`.  Roughly a third of the work, and it is what a
+// caller asking about definiteness, condition or a spectrum's shape
+// wants — none of which needs a vector.
+pub fn values_only(a: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laeig.values_only")
+
+// How many rows the factored matrix had.
+pub fn order(e: LaEigen) -> Int []
+    todo("linalg-nv.laeig.order")
+
+// The eigenvalues, descending, as a rank-1 array of length `n`.
+pub fn values(e: LaEigen) -> NdFloat []
+    todo("linalg-nv.laeig.values")
+
+// The eigenvectors as the columns of an `n x n` orthogonal matrix.
+pub fn vectors(e: LaEigen) -> NdFloat []
+    todo("linalg-nv.laeig.vectors")
+
+// The `k`th eigenvector, as a rank-1 array of length `n`.
+//
+// The accessor that removes the rows-or-columns question from every
+// call site.  `LaDimensionMismatch` for a `k` outside `0 ..= n - 1`.
+pub fn vector(e: LaEigen, k: Int) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laeig.vector")
+
+// The largest eigenvalue by absolute value, which is the matrix's
+// spectral radius.
+//
+// Not the same as `values(e)[0]`: the eigenvalues are sorted by VALUE
+// and not by magnitude, so a matrix with eigenvalues 1 and -5 has its
+// largest first and its largest-in-magnitude last.  The distinction is
+// exactly the one that makes a power-iteration convergence argument
+// right or wrong, so both are reachable and this one is named.
+pub fn spectral_radius(e: LaEigen) -> Float []
+    todo("linalg-nv.laeig.spectral_radius")
+
+// The 2-norm condition number: the largest absolute eigenvalue over the
+// smallest.
+//
+// For a SYMMETRIC matrix this is exact and needs no singular values,
+// which is why it is here as well as in `lanorm` — a caller who has
+// already decomposed should not pay for an SVD to learn something the
+// decomposition already knows.  `inf` when the smallest is zero.
+pub fn condition(e: LaEigen) -> Float []
+    todo("linalg-nv.laeig.condition")
+
+// How many eigenvalues are positive, zero and negative, as a triple —
+// the quadratic form's inertia.
+//
+// Sylvester's law of inertia is preserved under congruence, which makes
+// this the invariant an optimiser checks: a Hessian at a minimum is all
+// positive, at a saddle is mixed, and at a maximum is all negative.
+// `tolerance` is how close to zero counts as zero; `LaBadTolerance` for
+// a negative one.
+pub fn inertia(e: LaEigen, tolerance: Float) -> Result<LaInertia, LaFault> []
+    todo("linalg-nv.laeig.inertia")
+
+// LaInertia is the count of eigenvalues on each side of zero.
+//
+// A struct rather than a triple because three integers in a tuple at a
+// call site is three chances to read them in the wrong order.
+pub struct LaInertia
+    // How many eigenvalues are above the tolerance.
+    positive: Int
+    // How many are within the tolerance of zero.
+    zero: Int
+    // How many are below the negative tolerance.
+    negative: Int
+
+// The matrix raised to a real power, through its eigendecomposition:
+// `V diag(w^p) Vᵀ`.
+//
+// The reason an eigendecomposition is worth keeping as a value.  `p`
+// of 0.5 is the symmetric square root, which is what whitens data; `p`
+// of -1 is the inverse; `p` of -0.5 is the Mahalanobis transform.
+// Each is one line over factors already computed.
+//
+// `LaNotPositiveDefinite` when an eigenvalue is negative and `p` is not
+// an integer, because a negative number to a fractional power is not
+// real — and answering a NaN there would be a silent wrong answer
+// rather than a refusal.
+pub fn power(e: LaEigen, p: Float) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.laeig.power")
+
+// The product `V diag(w) Vᵀ` — the original matrix, reconstructed.
+//
+// The round trip every decomposition owes, and for an orthogonal `V` it
+// is also the check that `V` really is orthogonal.
+pub fn reconstruct(e: LaEigen) -> NdFloat []
+    todo("linalg-nv.laeig.reconstruct")

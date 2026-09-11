@@ -1,0 +1,252 @@
+// lasvd — the singular value decomposition, by one-sided Jacobi.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  `A = U Σ Vᵀ` for any `m x n` matrix: `U` has orthonormal
+// columns, `Σ` is diagonal and non-negative, `V` is orthogonal.  It is
+// the decomposition that works on every matrix — square or not, full
+// rank or not, well conditioned or not — and it is the only one here
+// that can answer what the rank IS.
+//
+// ONE-SIDED JACOBI, AND WHY THIS PACKAGE PICKS IT OVER GOLUB-KAHAN.
+// Both are in LAPACK — `dgesvd` and `dgesdd` are the Golub-Kahan
+// bidiagonalisation path, `dgesvj` the one-sided Jacobi one — and the
+// trade is the same shape as `laeig`'s:
+//
+//   GOLUB-KAHAN is faster: reduce to bidiagonal form with Householder
+//   reflections from both sides, then run an implicit QR iteration on
+//   the bidiagonal.  It is what `dgesdd` does and what numpy calls.
+//
+//   ONE-SIDED JACOBI is more ACCURATE, and provably so: Demmel and
+//   Veselić showed it computes every singular value to high RELATIVE
+//   accuracy for a matrix of the form `D B` with `B` well conditioned —
+//   which is any matrix whose columns are badly scaled, which is any
+//   design matrix whose columns are in different units.  The
+//   bidiagonal reduction destroys that before the iteration begins.
+//   It is also far simpler: orthogonalise pairs of COLUMNS by plane
+//   rotations until they are orthogonal, and the column norms are the
+//   singular values.
+//
+// So: one-sided Jacobi, for the same two reasons `laeig` picks Jacobi —
+// an interface package's first implementation should be the one a
+// reader can check, and accuracy on badly scaled matrices is worth more
+// to a notebook than a constant factor.  **The Golub-Kahan path can go
+// BEHIND these same signatures later**; `LaSvd` holds `U`, `Σ` and `V`
+// and says nothing about how they were found.
+//
+// THE THIN FORM IS THE DEFAULT AND THE FULL FORM IS A SEPARATE CALL.
+// For an `m x n` matrix with `m` much larger than `n` — every design
+// matrix — the full `U` is `m x m` and is mostly a basis for a space
+// nobody asked about.  `factor` answers the thin form (`U` is `m x k`,
+// `V` is `n x k`, `k = min(m, n)`), which is what a fit, a rank, a
+// pseudoinverse and a low-rank approximation all use.  `u_full` is
+// there for the caller who genuinely wants the orthogonal complement.
+//
+// SINGULAR VALUES ARE SORTED DESCENDING AND ARE NON-NEGATIVE.  Both are
+// conventions everybody shares and both are worth stating, because
+// "descending" is what makes `singular_values(s)[0]` the norm and
+// truncation at `k` the best rank-`k` approximation.
+
+use ndfloat
+
+// The default sweep limit for the one-sided Jacobi iteration: 30.
+//
+// The same number and the same reasoning as `laeig`'s: a sweep is one
+// pass over every column pair, practical matrices finish in under ten,
+// and 30 is the bound at which something is wrong rather than slow.
+pub const LASVD_SWEEPS = 30
+
+// LaSvd is a matrix's singular value decomposition, in the thin form.
+//
+// `A = U diag(s) Vᵀ` with `k = min(m, n)`: `U` is `m x k` with
+// orthonormal columns, `s` is `k` non-negative values descending, `V`
+// is `n x k` with orthonormal columns.
+//
+// ```novo
+// use ndfloat
+// use lasvd
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lasvd.factor(a)
+//                 Ok(s)   => println("${lasvd.count(s)}")   // 3
+//                 Err(er) => println(er.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct LaSvd
+    // `U`, `m x k`, orthonormal columns.
+    u: NdFloat
+    // The singular values, descending, a rank-1 array of length `k`.
+    s: NdFloat
+    // `V`, `n x k`, orthonormal columns.  NOT `Vᵀ` — LAPACK answers the
+    // transpose and numpy follows it, and this package does not,
+    // because `V`'s COLUMNS are the right singular vectors and a
+    // caller who wants the `k`th should index a column like everywhere
+    // else in this package.  The README names the difference, because
+    // a reader porting from numpy will meet it.
+    v: NdFloat
+    // How many rows the factored matrix had.
+    m: Int
+    // How many columns.
+    n: Int
+
+// The singular value decomposition, thin form, with the default sweep
+// limit.
+//
+// LAPACK `dgesvj`.  `LaNotMatrix` for an array that is not rank 2,
+// `LaEmptyMatrix` for a zero dimension, `LaNoConvergence` with the
+// limit and the residual reached.
+//
+// It refuses nothing about the matrix's CONTENT: a rank-deficient
+// matrix, a zero matrix and a badly conditioned one all decompose, and
+// what they have in common is small or zero singular values.  That is
+// the whole reason this decomposition exists.
+pub fn factor(a: NdFloat) -> Result<LaSvd, LaFault> []
+    todo("linalg-nv.lasvd.factor")
+
+// The decomposition with a sweep limit of the caller's choosing.
+pub fn factor_with_sweeps(a: NdFloat, sweeps: Int) -> Result<LaSvd, LaFault> []
+    todo("linalg-nv.lasvd.factor_with_sweeps")
+
+// Only the singular values, without accumulating `U` or `V`.
+//
+// LAPACK's `jobu = 'N', jobv = 'N'`.  What a caller asking about rank,
+// condition or the 2-norm wants, and none of those needs a vector.
+pub fn values_only(a: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasvd.values_only")
+
+// How many singular values there are: `min(m, n)`.
+pub fn count(s: LaSvd) -> Int []
+    todo("linalg-nv.lasvd.count")
+
+// How many rows the factored matrix had.
+pub fn rows(s: LaSvd) -> Int []
+    todo("linalg-nv.lasvd.rows")
+
+// How many columns.
+pub fn cols(s: LaSvd) -> Int []
+    todo("linalg-nv.lasvd.cols")
+
+// The singular values, descending, as a rank-1 array.
+pub fn singular_values(s: LaSvd) -> NdFloat []
+    todo("linalg-nv.lasvd.singular_values")
+
+// `U` in the thin form: `m x k`, orthonormal columns.
+pub fn u(s: LaSvd) -> NdFloat []
+    todo("linalg-nv.lasvd.u")
+
+// `V` in the thin form: `n x k`, orthonormal columns.  NOT `Vᵀ` — see
+// the struct's field comment.
+pub fn v(s: LaSvd) -> NdFloat []
+    todo("linalg-nv.lasvd.v")
+
+// The full `m x m` orthogonal `U`, with the columns beyond the first
+// `k` completing the basis.
+//
+// The caller who wants the orthogonal complement of the column space —
+// a residual projection, a null-space basis for the transpose — wants
+// this; everyone else wants `u`.  It costs the extra `m x (m - k)`
+// columns, which for a tall design matrix is most of the memory in the
+// problem.
+pub fn u_full(s: LaSvd) -> NdFloat []
+    todo("linalg-nv.lasvd.u_full")
+
+// The numerical rank: how many singular values exceed the tolerance.
+//
+// `tolerance` is ABSOLUTE.  numpy's `matrix_rank` defaults to
+// `max(m, n) * eps * s[0]`, which is a relative rule, and
+// `default_rank_tolerance` computes exactly that — but the argument
+// here is the number itself, because a caller who knows their data's
+// noise floor has a better tolerance than any default and a caller who
+// does not should be made to look at the question once.
+//
+// `LaBadTolerance` for a negative one.  Zero is meaningful and means
+// "count every non-zero value", which is the exact-arithmetic rank and
+// is almost never what floating-point data wants.
+//
+// ```novo
+// use ndfloat
+// use lasvd
+//
+// fn main() [io]
+//     match ndfloat.eye(3)
+//         Ok(a) =>
+//             match lasvd.factor(a)
+//                 Ok(s) =>
+//                     match lasvd.rank(s, 1e-12)
+//                         Ok(r)   => println("${r}")   // 3
+//                         Err(er) => println(er.message())
+//                 Err(er) => println(er.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn rank(s: LaSvd, tolerance: Float) -> Result<Int, LaFault> []
+    todo("linalg-nv.lasvd.rank")
+
+// numpy's default rank tolerance for this decomposition:
+// `max(m, n) * eps * s[0]`.
+//
+// Published so that a caller who wants numpy's answer can have it by
+// naming it, rather than by this package choosing it for them.
+pub fn default_rank_tolerance(s: LaSvd) -> Float []
+    todo("linalg-nv.lasvd.default_rank_tolerance")
+
+// The 2-norm condition number: the largest singular value over the
+// smallest.
+//
+// `inf` when the smallest is zero.  This is the definition the other
+// condition estimates approximate, and it is the expensive one —
+// `lanorm.condition_estimate` is the `n²` guess for a caller who only
+// needs an order of magnitude.
+pub fn condition(s: LaSvd) -> Float []
+    todo("linalg-nv.lasvd.condition")
+
+// The Moore-Penrose pseudoinverse: `V diag(1/s) Uᵀ`, with singular
+// values at or below the tolerance treated as zero.
+//
+// The inverse that exists for every matrix.  The truncation is not an
+// approximation to avoid — it is the definition, and inverting a
+// singular value of `1e-17` would amplify noise by `1e17`, which is how
+// a pseudoinverse produces a fit made entirely of rounding error.
+pub fn pseudoinverse(s: LaSvd, tolerance: Float) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasvd.pseudoinverse")
+
+// The MINIMUM-NORM least-squares solution of `A x = b`.
+//
+// LAPACK `dgelss`.  The one that answers where `laqr.lstsq` refuses: a
+// rank-deficient system has infinitely many least-squares solutions,
+// and this picks the one with the smallest `||x||₂`, which is the
+// standard choice and the only one with a definition.
+//
+// So the two least-squares paths are: `laqr.lstsq` when the matrix has
+// full column rank — faster, and it will tell you if it does not — and
+// this when it might not.  The README says it in a table.
+pub fn lstsq(s: LaSvd, b: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasvd.lstsq")
+
+// The best rank-`k` approximation, by the Eckart-Young theorem: the
+// first `k` singular values and their vectors, the rest dropped.
+//
+// The theorem is what makes this worth a function: truncating the SVD
+// gives the closest rank-`k` matrix in BOTH the 2-norm and the
+// Frobenius norm, and no other rank-`k` matrix is closer.  That is the
+// basis of principal component analysis, of latent semantic analysis
+// and of every low-rank compression.
+//
+// `LaDimensionMismatch` for a `k` outside `1 ..= count`.
+pub fn truncate(s: LaSvd, k: Int) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasvd.truncate")
+
+// The 2-norm of the original matrix: its largest singular value.
+//
+// The definition, not an estimate.  `lanorm.norm` with `LaNorm2` is
+// written in terms of this.
+pub fn norm_2(s: LaSvd) -> Float []
+    todo("linalg-nv.lasvd.norm_2")
+
+// The product `U diag(s) Vᵀ` — the original matrix, reconstructed.
+//
+// The round trip every decomposition owes.
+pub fn reconstruct(s: LaSvd) -> NdFloat []
+    todo("linalg-nv.lasvd.reconstruct")

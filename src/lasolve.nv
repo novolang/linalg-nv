@@ -1,0 +1,152 @@
+// lasolve — the one-call forms, for the caller who has one matrix and
+// one right-hand side and is not going to come back.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THESE EXIST WHEN THE DECOMPOSITIONS ARE RIGHT THERE.  A caller
+// who solves one system once should not have to know what an LU
+// factorisation is, and a package that made them learn would be
+// answering a design question with homework.  Every function here is
+// two lines — factor, then use — and every one of them names the module
+// a repeat caller should go to instead.
+//
+// AND WHY THEY ARE IN THEIR OWN MODULE RATHER THAN BESIDE THE
+// FACTORISATIONS.  Because the convenience and the value are different
+// promises, and putting them in one module hides which is which.  A
+// reader who opens `lalu` sees a factorisation that is worth keeping; a
+// reader who opens `lasolve` sees a page of functions that each say
+// "this throws the factorisation away".  That is the whole information,
+// and it is in the module boundary rather than repeated ten times.
+//
+// EVERY ONE OF THESE THROWS THE FACTORISATION AWAY.  Calling
+// `lasolve.solve(a, b)` in a loop over fifty right-hand sides does the
+// cubic work fifty times.  That is stated on each function, not because
+// a reader will not have read it here, but because the function is the
+// thing they will be looking at.
+
+use ndfloat
+
+// `x` such that `A x = b`, for a square `A`.
+//
+// LU with partial pivoting, then forward and back substitution — the
+// general-purpose solve, and the right one when nothing is known about
+// the matrix.  `LaSingular` when it is.
+//
+// **One shot.**  A caller with several right-hand sides wants
+// `lalu.factor` once and `lalu.solve` per side, at `n³/3` plus `k n²`
+// rather than `k n³/3`.
+//
+// ```novo
+// use ndfloat
+// use lasolve
+//
+// fn main() [io]
+//     match ndfloat.eye(2)
+//         Ok(a) =>
+//             match ndfloat.of_list([1.0, 2.0], [2])
+//                 Ok(b) =>
+//                     match lasolve.solve(a, b)
+//                         Ok(x)  => println("${ndfloat.size(x)}")   // 2
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn solve(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.solve")
+
+// `x` such that `A x = b`, for a symmetric positive-definite `A`.
+//
+// Cholesky, at half the work of `solve` — and `LaNotPositiveDefinite`
+// when the matrix is not one, which is also the standard test for
+// whether it is.  Only the lower triangle is read.
+//
+// **One shot.**  `lachol.factor` and `lachol.solve` for a repeat
+// caller.
+pub fn solve_spd(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.solve_spd")
+
+// `x` minimising `||A x - b||₂`, for a matrix with full column rank.
+//
+// Householder QR.  `LaSingular` when the columns are dependent — the
+// case `lstsq_minimum_norm` answers.
+//
+// **One shot.**  `laqr.factor` and `laqr.lstsq` for a repeat caller,
+// which is what fitting the same design matrix to fifty response
+// vectors is.
+pub fn lstsq(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.lstsq")
+
+// The minimum-norm `x` minimising `||A x - b||₂`, for a matrix of any
+// rank.
+//
+// The SVD path.  Slower than `lstsq` and it never refuses: a
+// rank-deficient system has infinitely many least-squares solutions and
+// this picks the smallest.
+//
+// `tolerance` is the absolute cut below which a singular value counts
+// as zero; `LaBadTolerance` for a negative one.
+//
+// **One shot.**  `lasvd.factor` and `lasvd.lstsq` for a repeat caller.
+pub fn lstsq_minimum_norm(a: NdFloat, b: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.lstsq_minimum_norm")
+
+// The inverse of a square matrix.
+//
+// LU, then `dgetri`.  The warning `lalu.inverse` carries applies in
+// full and is worth repeating where a caller will actually be looking:
+// **to solve a system, use `solve`.**  Forming the inverse and
+// multiplying is three times the work and loses accuracy, and the only
+// good reasons for an explicit inverse are that a formula needs its
+// entries or that it is being displayed.
+//
+// `LaSingular` for a singular matrix, which is the whole of what is
+// refused.
+pub fn inverse(a: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.inverse")
+
+// The determinant of a square matrix.
+//
+// LU, then the product of `U`'s diagonal with the permutation's sign.
+// Overflows for a large matrix of large entries, which is inherent —
+// `lalu.log_abs_determinant` is the call that does not.
+pub fn determinant(a: NdFloat) -> Result<Float, LaFault> []
+    todo("linalg-nv.lasolve.determinant")
+
+// The numerical rank of a matrix.
+//
+// An SVD and a count.  There is no cheaper honest answer: rank is a
+// question about how close the singular values get to zero, and no
+// factorisation that does not compute them can say.
+//
+// `tolerance` is absolute; `lasvd.default_rank_tolerance` is numpy's
+// rule for a caller who wants numpy's answer.
+pub fn rank(a: NdFloat, tolerance: Float) -> Result<Int, LaFault> []
+    todo("linalg-nv.lasolve.rank")
+
+// The Moore-Penrose pseudoinverse of a matrix.
+//
+// An SVD, reciprocal singular values above the tolerance, and the
+// transpose.  **One shot**: `lasvd.factor` and `lasvd.pseudoinverse`
+// for a repeat caller.
+pub fn pseudoinverse(a: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.pseudoinverse")
+
+// `x` such that `L x = b`, for a lower-triangular `L`.
+//
+// LAPACK `dtrsv`.  Forward substitution, at `n²`, with nothing factored
+// at all — the call for a caller who already HAS a triangular matrix,
+// from a Cholesky factor they kept, from a sparse structure they built,
+// or from a linear program's basis.
+//
+// Only the lower triangle is read; whatever is above it is ignored
+// rather than refused.  `LaSingular` for a zero on the diagonal.
+pub fn solve_lower(l: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.solve_lower")
+
+// `x` such that `U x = b`, for an upper-triangular `U`.
+//
+// Back substitution.  The other half of the pair, and only the upper
+// triangle is read.
+pub fn solve_upper(u: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
+    todo("linalg-nv.lasolve.solve_upper")

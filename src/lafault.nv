@@ -1,0 +1,127 @@
+// lafault — every way a decomposition or a solve can refuse.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THREE KINDS OF REFUSAL, AND TELLING THEM APART IS THE POINT.
+//
+//   A SHAPE refusal — a non-square matrix where a square one is
+//   required, two operands whose inner dimensions disagree, a rank-3
+//   array where a matrix was wanted.  The calling code is wrong, and it
+//   is wrong at compile time in spirit even though the shape only
+//   arrives at run time.
+//
+//   A MATHEMATICAL refusal — a singular matrix, a non-positive-definite
+//   one, a system with no solution.  The calling code is fine and the
+//   DATA says no.  A caller meeting one of these usually wants to fall
+//   back: a singular matrix wants `lstsq` rather than `solve`, a
+//   non-positive-definite one wants LU rather than Cholesky.  So these
+//   carry the number that made the decision — the pivot that was too
+//   small, the leading minor that went negative — because a caller
+//   deciding whether it is a genuine singularity or a scaling problem
+//   needs it.
+//
+//   A CONVERGENCE refusal — an iterative decomposition that ran out of
+//   sweeps.  Jacobi for the symmetric eigenproblem and one-sided Jacobi
+//   for the SVD both iterate, both converge in practice in under a
+//   dozen sweeps, and both are given a bound so that a pathological
+//   matrix stops rather than spins.  The refusal carries the bound and
+//   the residual reached, so a caller can raise one and retry.
+//
+// `is_shape_fault`, `is_singular_fault` and `is_convergence_fault` are
+// the three predicates, because a caller choosing a fallback should ask
+// a question rather than match a dozen arms.
+
+// LaFault is why a decomposition, a solve or a norm would not answer.
+pub enum LaFault
+    // An array that is not rank 2 where a matrix was required.  `rank`
+    // is what arrived.
+    LaNotMatrix(what: Str, rank: Int)
+    // An array that is not rank 1 where a vector was required.
+    LaNotVector(what: Str, rank: Int)
+    // A non-square matrix where a square one was required: LU, the
+    // eigendecomposition, the determinant, the inverse.
+    LaNotSquare(rows: Int, cols: Int)
+    // Two operands whose dimensions do not fit: a solve whose matrix
+    // has `rows` rows and whose right-hand side has `got` entries, a
+    // product whose inner dimensions disagree.
+    LaDimensionMismatch(want: Int, got: Int)
+    // A matrix with a zero dimension.  Every decomposition of an empty
+    // matrix is defensible and none of them is useful, so it is refused
+    // rather than invented.
+    LaEmptyMatrix(rows: Int, cols: Int)
+    // An overdetermined problem given fewer rows than columns where
+    // more were needed, or the reverse: a least-squares solve wants at
+    // least as many equations as unknowns for the standard QR path.
+    LaUnderdetermined(rows: Int, cols: Int)
+    // The matrix is singular, or close enough that the factorisation
+    // cannot continue.  `at` is the column whose pivot failed and
+    // `pivot` is how large it was — which is the number that says
+    // whether this is a genuine singularity or a matrix that wants
+    // scaling.
+    LaSingular(at: Int, pivot: Float)
+    // A Cholesky factorisation met a leading minor that was not
+    // positive.  `at` is the diagonal position and `value` is what the
+    // square root was asked for.  The usual cause is a covariance
+    // matrix that rounding has pushed just below zero, which is why the
+    // value is here rather than only the index.
+    LaNotPositiveDefinite(at: Int, value: Float)
+    // An iterative decomposition ran out of sweeps.  `sweeps` is the
+    // bound it was given and `residual` is the off-diagonal norm it had
+    // reached, so a caller can decide whether raising the bound is
+    // worth it.
+    LaNoConvergence(sweeps: Int, residual: Float)
+    // A tolerance that is negative.  Zero is meaningful — it means
+    // "exact" — and negative is not.
+    LaBadTolerance(tolerance: Float)
+    // A norm order this package does not compute.  `LaNorm` names the
+    // ones it does; this exists for the numeric `p` a vector p-norm
+    // takes, where `p` below 1 is not a norm.
+    LaBadNormOrder(p: Float)
+
+// message renders the refusal as one line of prose, with the numbers in
+// it.
+//
+// `Result<_, LaFault>` requires this impl: SPEC § 3.4 admits a `Result`
+// error type only if it implements `Error`.
+impl Error for LaFault
+    // Answer the one-line report: what refused, where, and the value
+    // that decided it.
+    //
+    // ```novo
+    // use lafault
+    //
+    // fn main() [io]
+    //     let e = LaNotSquare(rows: 3, cols: 4)
+    //     println(e.message())
+    //     // linalg: a 3 by 4 matrix is not square
+    // ```
+    fn message(self) -> Str
+        todo("linalg-nv.lafault.LaFault.message")
+
+// Whether this refusal is about SHAPE — the calling code is wrong.
+//
+// ```novo
+// use lafault
+//
+// fn main() [io]
+//     let a = lafault.is_shape_fault(LaNotSquare(rows: 3, cols: 4))
+//     let b = lafault.is_shape_fault(LaSingular(at: 1, pivot: 0.0))
+//     println("${a} ${b}")   // true false
+// ```
+pub fn is_shape_fault(e: LaFault) -> Bool []
+    todo("linalg-nv.lafault.is_shape_fault")
+
+// Whether this refusal is about the MATRIX — the data says no, and a
+// fallback is what the caller wants.
+//
+// `LaSingular` and `LaNotPositiveDefinite`.  A caller that met the
+// first wants `lasolve.lstsq` instead of `lasolve.solve`; one that met
+// the second wants LU instead of Cholesky.
+pub fn is_singular_fault(e: LaFault) -> Bool []
+    todo("linalg-nv.lafault.is_singular_fault")
+
+// Whether this refusal is a sweep limit — raising the bound and
+// retrying is a reasonable thing to do.
+pub fn is_convergence_fault(e: LaFault) -> Bool []
+    todo("linalg-nv.lafault.is_convergence_fault")

@@ -1,0 +1,47 @@
+[package]
+name        = "linalg-nv"
+version     = "0.0.1"
+description = "Dense linear algebra over ndarray-nv matrices: LU with partial pivoting, Householder QR, Cholesky, the symmetric eigendecomposition by cyclic Jacobi, and the singular value decomposition by one-sided Jacobi — each a value that holds its factors and answers solves, determinants, inverses, least squares, rank and condition number without factoring again.  Matrix and vector norms beside them, and LAPACK's own routine named for every function so a result can be checked against the reference.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: a decomposition is arithmetic over numbers the caller already
+# holds.  Nothing is read, nothing is written, no clock and no entropy
+# is consulted, and no scratch state is carried between calls — a
+# factorisation is a value.
+#
+# The package makes NO `@tier(embedded)` claim, and there is no
+# `tests/embedded_probe.nv`, so the audit's `core-embedded` row passes
+# and says so.  Two reasons, and the README has both: every matrix here
+# is an `NdFloat`, which is a heap value, and the fixed-size 3x3 and
+# 4x4 arithmetic a device would want already has a home in geometry-nv.
+layer       = "core"
+
+category    = "science"
+
+tags = ["linalg", "matrix", "lapack", "openblas", "nalgebra", "scipy", "svd", "decomposition", "science"]
+repository  = "https://github.com/novolang/linalg-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Decompositions as values, over ndarray-nv matrices"
+
+[dependencies]
+# ndarray-nv is the matrix.  Every function here takes or answers an
+# `NdFloat`, because a decomposition IS shaped — an LU factor is
+# `n x n`, a QR's `R` is `m x n`, an SVD's `U` is `m x m` — and a
+# package that passed flat lists with dimension arguments beside them
+# would be writing that shape by hand at every call.
+#
+# `core`, so the layer rule holds.
+ndarray-nv = "^0.0.1"
