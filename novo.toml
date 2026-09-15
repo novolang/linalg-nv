@@ -1,6 +1,6 @@
 [package]
 name        = "linalg-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Dense linear algebra over ndarray-nv matrices: LU with partial pivoting, Householder QR, Cholesky, the symmetric eigendecomposition by cyclic Jacobi, and the singular value decomposition by one-sided Jacobi — each a value that holds its factors and answers solves, determinants, inverses, least squares, rank and condition number without factoring again.  Matrix and vector norms beside them, and LAPACK's own routine named for every function so a result can be checked against the reference.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
