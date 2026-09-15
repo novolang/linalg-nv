@@ -246,8 +246,8 @@ faster path can be substituted later without changing a caller.
 - **A BLAS surface of its own.** See rule 11.
 - **A microcontroller build.** Every matrix here is an ndarray-nv array,
   which is a heap value, and a build for a device with no heap allocator
-  refuses a list literal (SPEC section 14.4). This package makes no
-  device claim and ships no device probe.
+  refuses a list literal (SPEC section 14.4). Nothing here is claimed to
+  build for such a device, and there is no `tests/embedded_probe.nv`.
 
 ## Related packages
 
