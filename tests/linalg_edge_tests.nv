@@ -1,0 +1,1620 @@
+// The edge suite for linalg-nv.
+//
+// The release suite beside this one is the specification and answers
+// what the package DOES.  This one answers what it REFUSES, and how
+// wrong it is when it answers.  Three things it pins that a success
+// path cannot:
+//
+//   * the shape refusals, each with the sentence it prints, because a
+//     caller reads that sentence and the calling code has to be fixed
+//     rather than worked around;
+//   * the singular and the near-singular matrix, side by side, because
+//     they are the case a linear algebra library exists to get right
+//     and the two are NOT the same case;
+//   * the numbers themselves, written out: every quantity asserted
+//     here is either hand-computed in the comment above it or the
+//     closed form of the 2 x 2 and 3 x 3 problems below, and the
+//     tolerance each one is compared at is stated on the line.
+
+use std.test
+use ndfloat
+use lafault
+use lalu
+use laqr
+use lachol
+use laeig
+use lasvd
+use lanorm
+use lasolve
+
+// The Frobenius norm of a difference, which is the one measurement
+// every round-trip assertion below is written in.  A residual is a
+// vector and a reconstruction defect is a matrix, so both shapes are
+// answered here: `lanorm.norm` wants a matrix and refuses a vector.
+fn defect(a: NdFloat, b: NdFloat) -> Float
+    match ndfloat.sub(a, b)
+        Ok(d)  =>
+            if ndfloat.rank(d) == 1
+                match lanorm.vector_norm(d)
+                    Ok(n)  => n
+                    Err(_) => math.infinity()
+            else
+                match lanorm.norm(d, LaNormFrobenius)
+                    Ok(n)  => n
+                    Err(_) => math.infinity()
+        Err(_) => math.infinity()
+
+// ── the shape refusals, each with its own sentence ──────────────────
+
+@test
+fn test_every_shape_refusal_says_what_the_calling_code_got_wrong()
+    // A rank-1 array where a matrix is wanted.  The refusal names the
+    // operation and the rank, because "not a matrix" without the rank
+    // leaves the caller to work out which of two mistakes they made.
+    match ndfloat.zeros([4])
+        Ok(v)  =>
+            match lalu.factor(v)
+                Ok(_)  => test.fail("a vector is not a matrix")
+                Err(e) =>
+                    match e
+                        LaNotMatrix(w, r) =>
+                            test.assert_eq_str(w, "lalu.factor")
+                            test.assert_eq(r, 1)
+                        _                 => test.fail("expected LaNotMatrix: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: lalu.factor wants a matrix and got an array of rank 1")
+        Err(e) => test.fail(e.message())
+    // A non-square matrix where squareness is required.
+    match ndfloat.zeros([3, 4])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(_)  => test.fail("a 3 by 4 matrix is not square")
+                Err(e) =>
+                    match e
+                        LaNotSquare(rows, cols) =>
+                            test.assert_eq(rows, 3)
+                            test.assert_eq(cols, 4)
+                        _                       => test.fail("expected LaNotSquare: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: a 3 by 4 matrix is not square")
+                    test.assert_eq(lafault.is_shape_fault(e), true)
+        Err(e) => test.fail(e.message())
+    // An empty matrix: every factorisation of one is defensible and
+    // none of them is useful.
+    match ndfloat.zeros([0, 0])
+        Ok(z)  =>
+            match lachol.factor(z)
+                Ok(_)  => test.fail("an empty matrix has no useful factorisation")
+                Err(e) =>
+                    test.assert_eq_str(e.message(), "linalg: a 0 by 0 matrix has no factorisation")
+        Err(e) => test.fail(e.message())
+    // More columns than rows, which is the LQ problem this package does
+    // not carry.
+    match ndfloat.zeros([2, 5])
+        Ok(w)  =>
+            match laqr.factor(w)
+                Ok(_)  => test.fail("Householder QR wants at least as many rows as columns")
+                Err(e) =>
+                    match e
+                        LaUnderdetermined(rows, cols) =>
+                            test.assert_eq(rows, 2)
+                            test.assert_eq(cols, 5)
+                        _                             => test.fail("expected LaUnderdetermined: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: a 2 by 5 matrix has more columns than rows")
+        Err(e) => test.fail(e.message())
+    // A matrix where a vector is wanted, and a vector of the wrong
+    // length where one of the right length is wanted.
+    match ndfloat.eye(2)
+        Ok(m)  =>
+            match lanorm.vector_norm(m)
+                Ok(_)  => test.fail("a vector norm wants a vector")
+                Err(e) =>
+                    match e
+                        LaNotVector(w, r) =>
+                            test.assert_eq_str(w, "lanorm.vector_norm")
+                            test.assert_eq(r, 2)
+                        _                 => test.fail("expected LaNotVector: ${e.message()}")
+                    test.assert_eq_str(e.message(),
+                        "linalg: lanorm.vector_norm wants a vector and got an array of rank 2")
+            // The matrix-vector product whose dimensions do not match:
+            // a 2 by 2 system cannot be solved against a 3-vector.
+            match lalu.factor(m)
+                Ok(lu) =>
+                    match ndfloat.of_list([1.0, 2.0, 3.0], [3])
+                        Ok(b3) =>
+                            match lalu.solve(lu, b3)
+                                Ok(_)  => test.fail("a 2 by 2 system has no 3-vector for a right-hand side")
+                                Err(e) =>
+                                    match e
+                                        LaDimensionMismatch(want, got) =>
+                                            test.assert_eq(want, 2)
+                                            test.assert_eq(got, 3)
+                                        _                              => test.fail("expected LaDimensionMismatch: ${e.message()}")
+                                    test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                            // And the raw product, refused by the array
+                            // layer underneath rather than reshaped.
+                            match ndfloat.matmul(m, b3)
+                                Ok(_)  => test.fail("a 2 by 2 product wants a 2-vector")
+                                Err(_) => test.assert(true)
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── the singular, and the near-singular ─────────────────────────────
+
+@test
+fn test_an_exactly_singular_matrix_is_refused_where_it_is_asked_for()
+    // `[[1, 2], [1, 2]]`: the second column is the first times two, so
+    // the elimination has nothing left in column 1 and says so.  The
+    // pivot is exactly zero, which is why `LaSingular` may be raised
+    // here at all.
+    match ndfloat.of_list([1.0, 2.0, 1.0, 2.0], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(_)  => test.fail("two identical rows have no factorisation")
+                Err(e) =>
+                    match e
+                        LaSingular(at, pivot) =>
+                            test.assert_eq(at, 1)
+                            test.assert_approx(pivot, 0.0, 0.0)
+                        _                     => test.fail("expected LaSingular: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: singular at column 1, pivot 0")
+                    test.assert_eq(lafault.is_singular_fault(e), true)
+                    test.assert_eq(lafault.is_shape_fault(e), false)
+                    test.assert_eq(lafault.is_convergence_fault(e), false)
+            // A triangular solve refuses a zero on the diagonal for the
+            // same reason and with the same sentence shape.
+            match ndfloat.zeros([2, 2])
+                Ok(z)  =>
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasolve.solve_lower(z, b)
+                                Ok(_)  => test.fail("a zero diagonal is singular")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: singular at column 0, pivot 0")
+                            // The upper solve substitutes from the
+                            // bottom up, so the first zero divisor it
+                            // meets is the LAST diagonal entry, and
+                            // the column it names is the one it was
+                            // working on rather than the first one in
+                            // the matrix.
+                            match lasolve.solve_upper(z, b)
+                                Ok(_)  => test.fail("a zero diagonal is singular")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: singular at column 1, pivot 0")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A singular matrix is not positive definite either, and Cholesky
+    // names the position and the value it was asked for the square root
+    // of — here an exact zero at position 1.
+    match ndfloat.of_list([1.0, 1.0, 1.0, 1.0], [2, 2])
+        Ok(s)  =>
+            match lachol.factor(s)
+                Ok(_)  => test.fail("a singular matrix is not positive definite")
+                Err(e) =>
+                    match e
+                        LaNotPositiveDefinite(at, v) =>
+                            test.assert_eq(at, 1)
+                            test.assert_approx(v, 0.0, 0.0)
+                        _                            => test.fail("expected LaNotPositiveDefinite: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: not positive definite at position 1, value 0")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_near_singular_matrix_factors_and_is_caught_by_the_number_instead()
+    // `[[1, 1], [1, 1 + 2^-52]]`: singular to within one rounding of
+    // the entries — one ULP, the smallest perturbation that makes a
+    // different Float64 from 1.0 — and NOT refused by `lalu.factor`,
+    // because a pivot of 2e-16 is not zero and the factorisation cannot
+    // tell the difference between a small pivot and a small matrix.
+    // This is the case the interface's doc comments promise is answered
+    // by a condition number rather than a refusal, and it is pinned
+    // here so that a refactor that "helpfully" tightened the pivot test
+    // would fail.
+    //
+    // The perturbation is 2^-52 and not 1e-16 because `1.0 + 1e-16` IS
+    // `1.0` in a Float64 — half an ULP below one is not a different
+    // number — and the matrix would be exactly singular again.
+    match ndfloat.of_list([1.0, 1.0, 1.0, 1.0 + 2.220446049250313e-16], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    test.assert_eq(lalu.order(lu), 2)
+                    match lanorm.norm(a, LaNorm1)
+                        Ok(n1) =>
+                            // Hand: the 1-norm of the inverse of
+                            // [[1, 1], [1, 1+e]] is about 1/e = 1e16,
+                            // and the 1-norm of the matrix is 2 + e.
+                            let est = lanorm.condition_estimate(lu, n1)
+                            test.assert_true(est > 1e14,
+                                "the estimate should see a 1e16 condition number, got ${est}")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // The SVD sees it too, and the rank at a tolerance of
+            // 1e-10 is 1 — the small singular value is 1e-16, which is
+            // BELOW the tolerance the caller named.  The tolerance is
+            // the claim, and this is what it claims.
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    test.assert_true(lasvd.condition(s) > 1e14, "the SVD should see it too")
+                    match lasvd.rank(s, 1e-10)
+                        Ok(r)  => test.assert_eq(r, 1)
+                        Err(e) => test.fail(e.message())
+                    // The same decomposition at a tolerance below the
+                    // noise calls it rank 2: the count is a claim about
+                    // the tolerance and nothing else.
+                    match lasvd.rank(s, 1e-20)
+                        Ok(r)  => test.assert_eq(r, 2)
+                        Err(e) => test.fail(e.message())
+                    // The QR path refuses a rank-deficient R at all,
+                    // because it has no tolerance to offer and a fit
+                    // built on 1e-16 is rounding error amplified.
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasolve.lstsq(a, b)
+                                Ok(_)  => test.fail("a near-singular R has no honest fit here")
+                                Err(e) => test.assert_eq(lafault.is_singular_fault(e), true)
+                        Err(e) => test.fail(e.message())
+                    // And the minimum-norm path answers, which is what
+                    // the other path's refusal points the caller at.
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasolve.lstsq_minimum_norm(a, b, 1e-10)
+                                Ok(x)  => test.assert_eq(ndfloat.size(x), 2)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── the numbers, written out ────────────────────────────────────────
+
+@test
+fn test_a_two_by_two_against_its_hand_computed_inverse_and_eigenvalues()
+    // A = [[4, 3], [6, 3]].
+    //   det        = 4*3 - 3*6 = 12 - 18 = -6
+    //   inverse    = (1/-6) [[3, -3], [-6, 4]] = [[-0.5, 0.5], [1, -0.6666666666666666]]
+    //   trace      = 7
+    //   1-norm     = max(4 + 6, 3 + 3) = 10   (max column sum)
+    //   inf-norm   = max(4 + 3, 6 + 3) = 9    (max row sum)
+    //   max entry  = 6
+    //   Frobenius  = sqrt(16 + 9 + 36 + 9) = sqrt(70)
+    //   eigenvalues solve x^2 - 7x - 6 = 0, so (7 + sqrt(73))/2 and
+    //   (7 - sqrt(73))/2 — descending: 7.772001872658766, -0.7720018726587656
+    match ndfloat.of_list([4.0, 3.0, 6.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match lasolve.determinant(a)
+                Ok(d)  => test.assert_approx(d, -6.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lasolve.inverse(a)
+                Ok(inv) =>
+                    match ndfloat.at(inv, [0, 0])
+                        Ok(v)  => test.assert_approx(v, -0.5, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(inv, [1, 1])
+                        Ok(v)  => test.assert_approx(v, -0.6666666666666666, 1e-12)
+                        Err(e) => test.fail(e.message())
+                Err(e)  => test.fail(e.message())
+            // A x = b for b = (1, 0) is the first column of the
+            // inverse, by hand: x = (-0.5, 1).
+            match ndfloat.of_list([1.0, 0.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve(a, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, -0.5, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            // And the residual, which is the assertion
+                            // that does not depend on my arithmetic:
+                            // ||A x - b|| is zero to the working
+                            // precision, stated at 1e-12.
+                            match ndfloat.matmul(a, x)
+                                Ok(ax) => test.assert_true(defect(ax, b) <= 1e-12, "the solve must leave a zero residual")
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lanorm.trace(a)
+                Ok(v)  => test.assert_approx(v, 7.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNorm1)
+                Ok(v)  => test.assert_approx(v, 10.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormInf)
+                Ok(v)  => test.assert_approx(v, 9.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormMax)
+                Ok(v)  => test.assert_approx(v, 6.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.norm(a, LaNormFrobenius)
+                Ok(v)  => test.assert_approx(v, math.sqrt(70.0), 1e-12)
+                Err(e) => test.fail(e.message())
+            // The 2-norm comes from the SVD and equals the closed form
+            // here: sqrt(7.5 + sqrt(56.25 + 6)) over the eigenvalues of
+            // AᵀA.  AᵀA = [[52, 30], [30, 18]]: trace 70, determinant
+            // 936 - 900 = 36, so the eigenvalues are 35 ± sqrt(35²-36)
+            // ... which is checked instead as the singular-value
+            // identity ||A||_F² = sum of the squared singular values,
+            // and as the largest being at least the Frobenius norm
+            // over sqrt(2).
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    let frob = math.sqrt(70.0)
+                    match lasvd.rank(s, 1e-12)
+                        Ok(r)  =>
+                            test.assert_eq(r, 2)
+                            let s1 = lasvd.norm_2(s)
+                            test.assert_true(s1 >= frob / math.sqrt(2.0),
+                                "the 2-norm dominates the Frobenius norm over sqrt(rank)")
+                            test.assert_true(s1 <= frob, "and the Frobenius norm dominates the 2-norm")
+                            // The products of the eigenvalues and its
+                            // sum, against the determinant and the
+                            // trace — the values are hand-computed,
+                            // these two identities are what an SVD and
+                            // a determinant can be checked against
+                            // without either being trusted.
+                            match ndfloat.at(lasvd.singular_values(s), [0])
+                                Ok(v0) =>
+                                    match ndfloat.at(lasvd.singular_values(s), [1])
+                                        Ok(v1) =>
+                                            test.assert_approx(v0 * v1, 6.0, 1e-10)
+                                            test.assert_approx(v0 * v0 + v1 * v1, 70.0, 1e-10)
+                                        Err(e) => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match laeig.factor(a)
+                Ok(w)  =>
+                    // The eigenproblem reads the LOWER triangle and
+                    // mirrors it, so the matrix it decomposes is the
+                    // symmetric one [[4, 6], [6, 3]] rather than the
+                    // [[4, 3], [6, 3]] the other calls saw.  Hand: the
+                    // eigenvalues solve x^2 - 7x - 24 = 0, so they are
+                    // (7 + sqrt(145))/2 = 9.520797289396148 and
+                    // (7 - sqrt(145))/2 = -2.520797289396148, whose sum
+                    // is the trace 7 and whose product is the
+                    // determinant 12 - 36 = -24.
+                    match ndfloat.at(laeig.values(w), [0])
+                        Ok(v0) =>
+                            match ndfloat.at(laeig.values(w), [1])
+                                Ok(v1) =>
+                                    test.assert_approx(v0 + v1, 7.0, 1e-10)
+                                    test.assert_approx(v0 * v1, -24.0, 1e-10)
+                                    test.assert_approx(v0, 9.520797289396148, 1e-10)
+                                    test.assert_approx(v1, -2.520797289396148, 1e-10)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    // The reconstruction is the round trip to the
+                    // matrix the decomposition USED — the mirrored
+                    // lower triangle — and the defect against that is
+                    // at the working precision.
+                    match ndfloat.of_list([4.0, 6.0, 6.0, 3.0], [2, 2])
+                        Ok(sym) =>
+                            test.assert_true(defect(laeig.reconstruct(w), sym) <= 1e-12,
+                                "the eigendecomposition must rebuild the symmetric matrix it used")
+                            // And against the matrix as given, the
+                            // defect is exactly the asymmetry: the
+                            // (0, 1) entry differs by 6 - 3 = 3 and it
+                            // is the only entry that does.
+                            test.assert_approx(defect(laeig.reconstruct(w), a), 3.0, 1e-10)
+                        Err(e)  => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_three_by_three_by_hand_including_a_least_squares_fit()
+    // A = [[2, 1, 1], [1, 3, 2], [1, 0, 0]].
+    //   det     = 2*(0-0) - 1*(0-2) + 1*(0-3) = 0 + 2 - 3 = -1
+    //   inverse = [[0, 0, 1], [-2, 1, 3], [3, -1, -5]]
+    //   and A x = (4, 5, 1) has the solution x = (1, 0, 2): the first
+    //   column times 1 plus the third times 2 is (2+2, 1+4, 1+0).
+    match ndfloat.of_list([2.0, 1.0, 1.0, 1.0, 3.0, 2.0, 1.0, 0.0, 0.0], [3, 3])
+        Ok(a)  =>
+            match lasolve.determinant(a)
+                Ok(d)  => test.assert_approx(d, -1.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match ndfloat.of_list([4.0, 5.0, 1.0], [3])
+                Ok(b)  =>
+                    match lasolve.solve(a, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [2])
+                                Ok(v)  => test.assert_approx(v, 2.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.matmul(a, x)
+                                Ok(ax) => test.assert_true(defect(ax, b) <= 1e-12,
+                                    "the 3 by 3 solve must leave a zero residual")
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lasolve.inverse(a)
+                Ok(inv) =>
+                    match ndfloat.at(inv, [0, 2])
+                        Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(inv, [1, 0])
+                        Ok(v)  => test.assert_approx(v, -2.0, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(inv, [2, 2])
+                        Ok(v)  => test.assert_approx(v, -5.0, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    // The inverse against the identity, as a matrix
+                    // product rather than an element: A A⁻¹ - I is zero
+                    // to the working precision.
+                    match ndfloat.matmul(a, inv)
+                        Ok(prod) =>
+                            match ndfloat.eye(3)
+                                Ok(i3) => test.assert_true(defect(prod, i3) <= 1e-12, "A A⁻¹ must be the identity")
+                                Err(e) => test.fail(e.message())
+                        Err(e)   => test.fail(e.message())
+                Err(e)  => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // The least-squares fit, by hand.  Fitting a + b x to (1,1), (2,2),
+    // (3,2): the normal equations are
+    //   [[3, 6], [6, 14]] [a, b] = [5, 11]
+    // whose determinant is 42 - 36 = 6, so
+    //   a = (14*5 - 6*11)/6 = 4/6 = 0.6666666666666666
+    //   b = (3*11 - 6*5)/6  = 3/6 = 0.5
+    match ndfloat.of_list([1.0, 1.0, 1.0, 2.0, 1.0, 3.0], [3, 2])
+        Ok(design) =>
+            match ndfloat.of_list([1.0, 2.0, 2.0], [3])
+                Ok(y)  =>
+                    // Both least-squares paths must agree with the hand
+                    // computation, at a tolerance of 1e-12.
+                    match laqr.lstsq(laqr.factor(design)!, y)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 0.6666666666666666, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 0.5, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match lasolve.lstsq(design, y)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 0.6666666666666666, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 0.5, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match lasolve.lstsq_minimum_norm(design, y, 1e-12)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 0.6666666666666666, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 0.5, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    // The orthogonal residual property, which is the
+                    // definition of a least-squares fit and does not
+                    // depend on the normal-equations arithmetic above:
+                    // Aᵀ(A x - y) = 0.
+                    match laqr.lstsq(laqr.factor(design)!, y)
+                        Ok(x)  =>
+                            match ndfloat.matmul(design, x)
+                                Ok(resid) =>
+                                    match ndfloat.sub(resid, y)
+                                        Ok(r)  =>
+                                            match ndfloat.matmul(ndfloat.transpose(design), r)
+                                                Ok(grad) =>
+                                                    match lanorm.vector_norm(grad)
+                                                        Ok(n)  => test.assert_true(n <= 1e-10,
+                                                            "the residual must be orthogonal to the column space")
+                                                        Err(e) => test.fail(e.message())
+                                                Err(e)   => test.fail(e.message())
+                                        Err(e) => test.fail(e.message())
+                                Err(e)    => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e)     => test.fail(e.message())
+
+// ── the tolerance refusals, and the ones a sweep limit raises ───────
+
+@test
+fn test_a_tolerance_is_a_claim_and_a_negative_one_is_refused()
+    match ndfloat.of_list([3.0, 0.0, 0.0, 1.0], [2, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    // The tolerance decides the count, and both counts
+                    // below are correct answers to different questions.
+                    match lasvd.rank(s, 1e-10)
+                        Ok(r)  => test.assert_eq(r, 2)
+                        Err(e) => test.fail(e.message())
+                    match lasvd.rank(s, 2.0)
+                        Ok(r)  => test.assert_eq(r, 1)
+                        Err(e) => test.fail(e.message())
+                    match lasvd.rank(s, 4.0)
+                        Ok(r)  => test.assert_eq(r, 0)
+                        Err(e) => test.fail(e.message())
+                    match lasvd.rank(s, -1.0)
+                        Ok(_)  => test.fail("a tolerance is not negative")
+                        Err(e) =>
+                            match e
+                                LaBadTolerance(t) => test.assert_approx(t, -1.0, 0.0)
+                                _                 => test.fail("expected LaBadTolerance: ${e.message()}")
+                            test.assert_eq_str(e.message(), "linalg: a tolerance of -1 is negative")
+                    // numpy's rule, written out: max(m, n) * eps * s[0].
+                    test.assert_approx(lasvd.default_rank_tolerance(s), 2.0 * 2.220446049250313e-16 * 3.0, 1e-30)
+                    // The pseudoinverse and the least-squares path
+                    // refuse a negative tolerance the same way, and the
+                    // one-shot form refuses it before it factors.
+                    match lasvd.pseudoinverse(s, -1.0)
+                        Ok(_)  => test.fail("a tolerance is not negative")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a tolerance of -1 is negative")
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasvd.lstsq(s, b, -1.0)
+                                Ok(_)  => test.fail("a tolerance is not negative")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: a tolerance of -1 is negative")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lasolve.rank(a, -2.0)
+                Ok(_)  => test.fail("a tolerance is not negative")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: a tolerance of -2 is negative")
+            match lasolve.pseudoinverse(a, -2.0)
+                Ok(_)  => test.fail("a tolerance is not negative")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: a tolerance of -2 is negative")
+            match lasolve.lstsq_minimum_norm(a, a, -2.0)
+                Ok(_)  => test.fail("a tolerance is not negative")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: a tolerance of -2 is negative")
+            // The eigenproblem's inertia takes a tolerance too, and the
+            // 1-norm estimator's caller has nothing to refuse.
+            match laeig.factor(a)
+                Ok(e)   =>
+                    match laeig.inertia(e, -1.0)
+                        Ok(_)   => test.fail("a tolerance is not negative")
+                        Err(er) => test.assert_eq_str(er.message(), "linalg: a tolerance of -1 is negative")
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+    // A norm order below 1 is refused, and the sentence names the
+    // order rather than the array.
+    match ndfloat.of_list([3.0, 4.0], [2])
+        Ok(x)  =>
+            match lanorm.vector_norm_p(x, 0.5)
+                Ok(_)  => test.fail("below p = 1 that is not a norm")
+                Err(e) =>
+                    match e
+                        LaBadNormOrder(p) => test.assert_approx(p, 0.5, 0.0)
+                        _                 => test.fail("expected LaBadNormOrder: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: a norm order of 0.5 is below 1")
+            // And the orders at and above 1 answer, including the
+            // infinity one, which is the maximum absolute entry and is
+            // NOT reachable by passing a large float.
+            match lanorm.vector_norm_p(x, 1.0)
+                Ok(v)  => test.assert_approx(v, 7.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_p(x, 2.0)
+                Ok(v)  => test.assert_approx(v, 5.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_p(x, math.infinity())
+                Ok(v)  => test.assert_approx(v, 4.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_inf(x)
+                Ok(v)  => test.assert_approx(v, 4.0, 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_running_out_of_sweeps_is_a_refusal_with_the_residual_in_it()
+    // `[[4, 2], [2, 3]]` at a sweep limit of ZERO: nothing is
+    // orthogonalised, so the off-diagonal is still there and the
+    // refusal reports the size of it.  Hand: the off-diagonal entry is
+    // 2, so the residual is exactly 2 for the eigenproblem and the
+    // norm of the single off-diagonal of AᵀA — also entry (0,1) of
+    // AᵀA, which is 4*2 + 2*3 = 14 — for the SVD.
+    match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match laeig.factor_with_sweeps(a, 0)
+                Ok(_)  => test.fail("an unrotated symmetric matrix has not converged")
+                Err(e) =>
+                    match e
+                        LaNoConvergence(sweeps, residual) =>
+                            test.assert_eq(sweeps, 0)
+                            test.assert_approx(residual, 2.0, 1e-12)
+                        _                                 => test.fail("expected LaNoConvergence: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: no convergence in 0 sweep(s), residual 2")
+                    test.assert_eq(lafault.is_convergence_fault(e), true)
+                    test.assert_eq(lafault.is_shape_fault(e), false)
+            match lasvd.factor_with_sweeps(a, 0)
+                Ok(_)  => test.fail("an unrotated matrix has not converged")
+                Err(e) =>
+                    match e
+                        LaNoConvergence(sweeps, residual) =>
+                            test.assert_eq(sweeps, 0)
+                            test.assert_approx(residual, 14.0, 1e-12)
+                        _                                 => test.fail("expected LaNoConvergence: ${e.message()}")
+                    test.assert_eq_str(e.message(), "linalg: no convergence in 0 sweep(s), residual 14")
+        Err(e) => test.fail(e.message())
+    // A diagonal matrix IS converged at zero sweeps, and refusing it
+    // would be a lie about the residual: there is no off-diagonal to
+    // drive to zero.  The sweep limit is a bound on the work, not a
+    // demand that work be done.
+    match ndfloat.of_list([3.0, 0.0, 0.0, 1.0], [2, 2])
+        Ok(d)  =>
+            match laeig.factor_with_sweeps(d, 0)
+                Ok(e)   => test.assert_eq(laeig.order(e), 2)
+                Err(er) => test.fail(er.message())
+            match lasvd.factor_with_sweeps(d, 0)
+                Ok(s)   => test.assert_eq(lasvd.count(s), 2)
+                Err(er) => test.fail(er.message())
+        Err(e) => test.fail(e.message())
+
+// ── the triangular solves, the estimator, and the defects ──────────
+
+@test
+fn test_a_triangular_system_by_hand_and_the_estimator_against_the_true_number()
+    // L = [[2, 0], [1, 3]], U = [[2, 1], [0, 3]].
+    //   L x = (2, 4):  x0 = 1, x1 = (4 - 1*1)/3 = 1
+    //   U x = (3, 3):  x1 = 1, x0 = (3 - 1*1)/2 = 1
+    match ndfloat.of_list([2.0, 0.0, 1.0, 3.0], [2, 2])
+        Ok(l)  =>
+            match ndfloat.of_list([2.0, 4.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve_lower(l, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match ndfloat.of_list([2.0, 1.0, 0.0, 3.0], [2, 2])
+        Ok(u)  =>
+            match ndfloat.of_list([3.0, 3.0], [2])
+                Ok(b)  =>
+                    match lasolve.solve_upper(u, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    // The two halves agree with the general solve: the
+                    // same triangular matrix solved as a full system.
+                    match lasolve.solve(u, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // The 1-norm condition estimate against the true number, which is
+    // hand-computed: for [[1, 2], [3, 4]],
+    //   ||A||₁    = max(1 + 3, 2 + 4) = 6
+    //   A⁻¹       = [[-2, 1], [1.5, -0.5]]
+    //   ||A⁻¹||₁  = max(2 + 1.5, 1 + 0.5) = 3.5
+    //   condition = 6 * 3.5 = 21
+    // Hager's estimator looks at columns, so on a 2 by 2 matrix it can
+    // look at both of them and answers exactly.
+    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    match lanorm.norm(a, LaNorm1)
+                        Ok(n1) =>
+                            test.assert_approx(n1, 6.0, 1e-12)
+                            test.assert_approx(lanorm.condition_estimate(lu, n1), 21.0, 1e-10)
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // And the exact 2-norm condition number of the same matrix,
+            // from the SVD, is bounded below by 1 and above by the
+            // 1-norm's: the two are different questions.
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    test.assert_true(lasvd.condition(s) >= 1.0, "every condition number is at least 1")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_defects_answer_the_questions_the_factors_skip()
+    // A matrix that is neither symmetric nor orthogonal.
+    //   Q = [[1, 1], [0, 1]]: QᵀQ = [[1, 1], [1, 2]], so QᵀQ - I has
+    //   Frobenius norm sqrt(0 + 1 + 1 + 1) = sqrt(3).
+    //   A - Aᵀ = [[0, 1], [-1, 0]] has Frobenius norm sqrt(2), and
+    //   ||A||_F = sqrt(3), so the relative symmetry defect is
+    //   sqrt(2/3) = 0.816496580927726.
+    match ndfloat.of_list([1.0, 1.0, 0.0, 1.0], [2, 2])
+        Ok(q)  =>
+            match lanorm.orthogonality_defect(q)
+                Ok(v)  => test.assert_approx(v, math.sqrt(3.0), 1e-12)
+                Err(e) => test.fail(e.message())
+            match lanorm.symmetry_defect(q)
+                Ok(v)  => test.assert_approx(v, 0.816496580927726, 1e-12)
+                Err(e) => test.fail(e.message())
+            // And an exactly symmetric matrix has a defect of zero, at
+            // an asserted tolerance rather than by element equality.
+            match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+                Ok(s)  =>
+                    match lanorm.symmetry_defect(s)
+                        Ok(v)  => test.assert_approx(v, 0.0, 1e-15)
+                        Err(e) => test.fail(e.message())
+                    match lanorm.orthogonality_defect(s)
+                        Ok(v)  => test.assert_true(v > 0.0, "a covariance matrix is not orthogonal")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A matrix of zeros is symmetric by definition here rather than by
+    // 0/0, and a 1 by 1 matrix has no asymmetry to measure.
+    match ndfloat.zeros([2, 2])
+        Ok(z)  =>
+            match lanorm.symmetry_defect(z)
+                Ok(v)  => test.assert_approx(v, 0.0, 0.0)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match ndfloat.of_list([5.0], [1, 1])
+        Ok(one) =>
+            match lanorm.symmetry_defect(one)
+                Ok(v)  => test.assert_approx(v, 0.0, 0.0)
+                Err(e) => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+    // Symmetry has no meaning for a matrix that has no transpose of the
+    // same shape, and the refusal says which shape arrived.
+    match ndfloat.zeros([2, 3])
+        Ok(w)  =>
+            match lanorm.symmetry_defect(w)
+                Ok(_)  => test.fail("A - Aᵀ needs a square matrix")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: a 2 by 3 matrix is not square")
+        Err(e) => test.fail(e.message())
+
+// ── the branches the success paths do not reach ─────────────────────
+
+@test
+fn test_the_extremes_of_the_decompositions_answer_rather_than_refuse()
+    // A rank-deficient SVD still owes a U whose columns are
+    // orthonormal: the zero column has to be completed with something,
+    // and a completion that is not orthonormal is a corrupt answer
+    // rather than a missing one.
+    match ndfloat.of_list([1.0, 2.0, 1.0, 2.0], [2, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    match lanorm.orthogonality_defect(lasvd.u_full(s))
+                        Ok(d)  => test.assert_true(d <= 1e-12, "the completed U must be orthonormal, defect ${d}")
+                        Err(e) => test.fail(e.message())
+                    // Eckart-Young: the best rank-1 approximation of a
+                    // rank-1 matrix is the matrix, at 1e-12.
+                    match lasvd.truncate(s, 1)
+                        Ok(t)  => test.assert_true(defect(t, a) <= 1e-12, "a rank-1 matrix is its own rank-1 approximation")
+                        Err(e) => test.fail(e.message())
+                    // Truncating to the full count is the reconstruction
+                    // and refuses nothing; below 1 and above the count
+                    // it refuses with the count it has.
+                    match lasvd.truncate(s, 2)
+                        Ok(t)  => test.assert_true(defect(t, a) <= 1e-12, "the full truncation is the matrix")
+                        Err(e) => test.fail(e.message())
+                    match lasvd.truncate(s, 0)
+                        Ok(_)  => test.fail("a rank-0 approximation is not offered")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 0 where 2 was wanted")
+                    // The pseudoinverse of a singular matrix is not the
+                    // inverse of anything, but it exists and it satisfies
+                    // the one identity that defines it: A A⁺ A = A.
+                    match lasvd.pseudoinverse(s, 1e-10)
+                        Ok(p)  =>
+                            match ndfloat.matmul(a, p)
+                                Ok(ap) =>
+                                    match ndfloat.matmul(ap, a)
+                                        Ok(apa) => test.assert_true(defect(apa, a) <= 1e-12, "A A⁺ A must be A")
+                                        Err(e)  => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // The zero matrix decomposes instead of refusing: it is the matrix
+    // with every singular value at zero, and that is an answer.
+    match ndfloat.zeros([2, 2])
+        Ok(z)  =>
+            match lasvd.factor(z)
+                Ok(s)  =>
+                    test.assert_approx(lasvd.norm_2(s), 0.0, 0.0)
+                    test.assert_approx(lasvd.condition(s), math.infinity(), 0.0)
+                    match lanorm.orthogonality_defect(lasvd.u_full(s))
+                        Ok(d)  => test.assert_true(d <= 1e-12, "even the zero matrix owes an orthonormal completion")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // Cholesky refuses the zero matrix instead: it is not
+            // positive definite, and the predicate that asks says so
+            // without a Result in the way.
+            test.assert_eq(lachol.is_positive_definite(z), false)
+            match lachol.factor(z)
+                Ok(_)  => test.fail("the zero matrix is not positive definite")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: not positive definite at position 0, value 0")
+        Err(e) => test.fail(e.message())
+    // The wide case has no Householder QR and does have an SVD, and the
+    // asymmetry is the point of the two modules being separate.
+    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])
+        Ok(w)  =>
+            match lasvd.factor(w)
+                Ok(s)  =>
+                    test.assert_eq(lasvd.rows(s), 2)
+                    test.assert_eq(lasvd.cols(s), 3)
+                    test.assert_eq(lasvd.count(s), 2)
+                    // The known closed form: AᵀA = [[14, 32], [32, 77]]
+                    // has trace 91 and determinant 1078 - 1024 = 54, so
+                    // its eigenvalues are (91 ± sqrt(91² - 216))/2 =
+                    // (91 ± sqrt(8065))/2, and the singular values are
+                    // their square roots.
+                    match ndfloat.at(lasvd.singular_values(s), [0])
+                        Ok(v)  => test.assert_approx(v, math.sqrt((91.0 + math.sqrt(8065.0)) / 2.0), 1e-10)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(lasvd.singular_values(s), [1])
+                        Ok(v)  => test.assert_approx(v, math.sqrt((91.0 - math.sqrt(8065.0)) / 2.0), 1e-10)
+                        Err(e) => test.fail(e.message())
+                    test.assert_true(defect(lasvd.reconstruct(s), w) <= 1e-12,
+                        "the wide reconstruction is the matrix")
+                    // The minimum-norm fit through the wide matrix, by
+                    // hand: for A = [[1, 2, 3], [4, 5, 6]] and b = (1, 1),
+                    //   AAᵀ = [[14, 32], [32, 77]], determinant 54,
+                    //   (AAᵀ)⁻¹b = (1/54)(77 - 32, -32 + 14) = (5/6, -1/3),
+                    //   x = Aᵀ(5/6, -1/3) = (-1/2, 0, 1/2).
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasolve.lstsq_minimum_norm(w, b, 1e-12)
+                                Ok(x)  =>
+                                    match ndfloat.at(x, [0])
+                                        Ok(v)  => test.assert_approx(v, -0.5, 1e-12)
+                                        Err(e) => test.fail(e.message())
+                                    match ndfloat.at(x, [1])
+                                        Ok(v)  => test.assert_approx(v, 0.0, 1e-12)
+                                        Err(e) => test.fail(e.message())
+                                    match ndfloat.at(x, [2])
+                                        Ok(v)  => test.assert_approx(v, 0.5, 1e-12)
+                                        Err(e) => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    // And the fully-determined case answers through the
+                    // same call: b of length 2, which is this matrix's
+                    // row count.
+                    match ndfloat.of_list([1.0, 1.0], [2])
+                        Ok(b)  =>
+                            match lasolve.lstsq_minimum_norm(w, b, 1e-12)
+                                Ok(x)  => test.assert_eq(ndfloat.size(x), 3)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match laqr.factor(w)
+                Ok(_)  => test.fail("a wide matrix has no Householder QR here")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: a 2 by 3 matrix has more columns than rows")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_spd_path_reads_one_triangle_and_the_vector_paths_take_both_shapes()
+    // `solve_spd` accepts a vector or a matrix as the right-hand side,
+    // and the matrix case is the several-right-hand-sides caller.
+    match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match ndfloat.of_list([6.0, 5.0], [2])
+                Ok(b)  =>
+                    // A x = b with x = (1, 1): 4 + 2 = 6 and 2 + 3 = 5.
+                    match lasolve.solve_spd(a, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // A rank-2 right-hand side answers a rank-2 solution.
+            match lasolve.solve_spd(a, a)
+                Ok(x)  => test.assert_eq(ndfloat.rank(x), 2)
+                Err(e) => test.fail(e.message())
+            // A non-symmetric matrix is not refused by Cholesky — only
+            // the lower triangle is read, by design — and the defect
+            // measurement is where the caller finds out.
+            match ndfloat.of_list([4.0, 99.0, 2.0, 3.0], [2, 2])
+                Ok(lower_ok) =>
+                    test.assert_eq(lachol.is_positive_definite(lower_ok), true)
+                    match lanorm.symmetry_defect(lower_ok)
+                        Ok(d)  => test.assert_true(d > 0.0, "the upper triangle is not the lower one")
+                        Err(e) => test.fail(e.message())
+                Err(e)       => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // The unscaled vector norm is not the sum of squares: a vector of
+    // entries around 1e200 squares to infinity the naive way and is
+    // finite here.  3e200 by 4e200 is 5e200, and the tolerance is on
+    // the relative error because the number is huge.
+    match ndfloat.of_list([3.0e200, 4.0e200], [2])
+        Ok(big) =>
+            match lanorm.vector_norm(big)
+                Ok(v)  => test.assert_approx(v, 5.0e200, 1e185)
+                Err(e) => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+    match ndfloat.of_list([3.0e-200, 4.0e-200], [2])
+        Ok(small) =>
+            match lanorm.vector_norm(small)
+                Ok(v)  => test.assert_approx(v, 5.0e-200, 1e-212)
+                Err(e) => test.fail(e.message())
+        Err(e)    => test.fail(e.message())
+    // A vector of zeros has no scale to divide by and still has a norm.
+    match ndfloat.zeros([3])
+        Ok(z)  =>
+            match lanorm.vector_norm(z)
+                Ok(v)  => test.assert_approx(v, 0.0, 0.0)
+                Err(e) => test.fail(e.message())
+            match lanorm.vector_norm_p(z, 3.0)
+                Ok(v)  => test.assert_approx(v, 0.0, 0.0)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_one_shot_forms_and_the_factors_answer_the_same_numbers()
+    // Each one-shot call against the factorisation it wraps, on a
+    // matrix with a hand-computed answer: A = [[2, 1], [1, 3]] has
+    // determinant 5 and inverse (1/5)[[3, -1], [-1, 2]].
+    match ndfloat.of_list([2.0, 1.0, 1.0, 3.0], [2, 2])
+        Ok(a)  =>
+            match ndfloat.of_list([3.0, 4.0], [2])
+                Ok(b)  =>
+                    // x = (1, 1): 2 + 1 = 3 and 1 + 3 = 4.
+                    match lasolve.solve(a, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                            match ndfloat.at(x, [1])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                    match lalu.solve(lalu.factor(a)!, b)
+                        Ok(x)  =>
+                            match ndfloat.at(x, [0])
+                                Ok(v)  => test.assert_approx(v, 1.0, 1e-12)
+                                Err(e) => test.fail(e.message())
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match lasolve.determinant(a)
+                Ok(d)  => test.assert_approx(d, 5.0, 1e-12)
+                Err(e) => test.fail(e.message())
+            match lasolve.inverse(a)
+                Ok(inv) =>
+                    match ndfloat.at(inv, [0, 0])
+                        Ok(v)  => test.assert_approx(v, 0.6, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(inv, [1, 1])
+                        Ok(v)  => test.assert_approx(v, 0.4, 1e-12)
+                        Err(e) => test.fail(e.message())
+                    match ndfloat.at(inv, [0, 1])
+                        Ok(v)  => test.assert_approx(v, -0.2, 1e-12)
+                        Err(e) => test.fail(e.message())
+                Err(e)  => test.fail(e.message())
+            // The Cholesky path answers the same solve on the same
+            // matrix, because it is positive definite.
+            match lasolve.solve_spd(a, a)
+                Ok(x)  => test.assert_eq(ndfloat.rank(x), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A non-positive-definite matrix through the SPD path is refused
+    // with the position and the value, not with a wrong answer.
+    match ndfloat.of_list([1.0, 0.0, 0.0, -1.0], [2, 2])
+        Ok(indef) =>
+            match lasolve.solve_spd(indef, indef)
+                Ok(_)  => test.fail("an indefinite matrix is not positive definite")
+                Err(e) => test.assert_eq_str(e.message(), "linalg: not positive definite at position 1, value -1")
+        Err(e)    => test.fail(e.message())
+
+@test
+fn test_the_fault_classification_is_a_table_the_caller_can_branch_on()
+    // Each variant against the three predicates, because what a caller
+    // does next differs: fix the calling code, fall back to another
+    // factorisation, or raise a bound.
+    let shape = LaNotSquare(rows: 3, cols: 4)
+    test.assert_eq(lafault.is_shape_fault(shape), true)
+    test.assert_eq(lafault.is_singular_fault(shape), false)
+    test.assert_eq(lafault.is_convergence_fault(shape), false)
+    let singular = LaSingular(at: 2, pivot: 0.0)
+    test.assert_eq(lafault.is_shape_fault(singular), false)
+    test.assert_eq(lafault.is_singular_fault(singular), true)
+    test.assert_eq(lafault.is_convergence_fault(singular), false)
+    let converged = LaNoConvergence(sweeps: 30, residual: 1e-3)
+    test.assert_eq(lafault.is_shape_fault(converged), false)
+    test.assert_eq(lafault.is_singular_fault(converged), false)
+    test.assert_eq(lafault.is_convergence_fault(converged), true)
+    // A tolerance and a norm order are neither: they are the calling
+    // code's mistake, but they are not about a shape.
+    let tol = LaBadTolerance(tolerance: -1.0)
+    test.assert_eq(lafault.is_shape_fault(tol), false)
+    test.assert_eq(lafault.is_singular_fault(tol), false)
+    test.assert_eq(lafault.is_convergence_fault(tol), false)
+    let order = LaBadNormOrder(p: 0.5)
+    test.assert_eq(lafault.is_shape_fault(order), false)
+    test.assert_eq(lafault.is_singular_fault(order), false)
+    test.assert_eq(lafault.is_convergence_fault(order), false)
+    // An empty matrix and an underdetermined one are shape faults, and
+    // each answers with the dims it was given.
+    let empty = LaEmptyMatrix(rows: 0, cols: 0)
+    test.assert_eq(lafault.is_shape_fault(empty), true)
+    let wide = LaUnderdetermined(rows: 2, cols: 5)
+    test.assert_eq(lafault.is_shape_fault(wide), true)
+    // And every one of them renders a sentence with the numbers in it,
+    // because the sentences are what a caller reads.
+    test.assert_true(shape.message().len() > 0, "a fault message is never empty")
+    test.assert_true(singular.message().len() > 0, "a fault message is never empty")
+    test.assert_true(converged.message().len() > 0, "a fault message is never empty")
+    test.assert_true(tol.message().len() > 0, "a fault message is never empty")
+    test.assert_true(order.message().len() > 0, "a fault message is never empty")
+    test.assert_true(empty.message().len() > 0, "a fault message is never empty")
+    test.assert_true(wide.message().len() > 0, "a fault message is never empty")
+
+@test
+fn test_the_fault_predicates_over_every_variant_the_interface_can_produce()
+    // Three questions, eleven refusals, and what a caller does next
+    // depends on the answers: fix the calling code, switch to another
+    // factorisation, or raise the sweep bound.  Every cell is asserted,
+    // including the ones this suite has no other reason to reach.
+    let not_mat = LaNotMatrix(what: "x", rank: 1)
+    test.assert_eq(lafault.is_shape_fault(not_mat), true)
+    test.assert_eq(lafault.is_singular_fault(not_mat), false)
+    test.assert_eq(lafault.is_convergence_fault(not_mat), false)
+    let not_vec = LaNotVector(what: "x", rank: 2)
+    test.assert_eq(lafault.is_shape_fault(not_vec), true)
+    test.assert_eq(lafault.is_singular_fault(not_vec), false)
+    test.assert_eq(lafault.is_convergence_fault(not_vec), false)
+    let not_sq = LaNotSquare(rows: 2, cols: 3)
+    test.assert_eq(lafault.is_shape_fault(not_sq), true)
+    test.assert_eq(lafault.is_singular_fault(not_sq), false)
+    test.assert_eq(lafault.is_convergence_fault(not_sq), false)
+    let mismatch = LaDimensionMismatch(want: 2, got: 3)
+    test.assert_eq(lafault.is_shape_fault(mismatch), true)
+    test.assert_eq(lafault.is_singular_fault(mismatch), false)
+    test.assert_eq(lafault.is_convergence_fault(mismatch), false)
+    let empty = LaEmptyMatrix(rows: 0, cols: 0)
+    test.assert_eq(lafault.is_shape_fault(empty), true)
+    test.assert_eq(lafault.is_singular_fault(empty), false)
+    test.assert_eq(lafault.is_convergence_fault(empty), false)
+    let under = LaUnderdetermined(rows: 2, cols: 5)
+    test.assert_eq(lafault.is_shape_fault(under), true)
+    test.assert_eq(lafault.is_singular_fault(under), false)
+    test.assert_eq(lafault.is_convergence_fault(under), false)
+    let singular = LaSingular(at: 1, pivot: 0.0)
+    test.assert_eq(lafault.is_shape_fault(singular), false)
+    test.assert_eq(lafault.is_singular_fault(singular), true)
+    test.assert_eq(lafault.is_convergence_fault(singular), false)
+    // A matrix that is not positive definite is a singular fault as far
+    // as a caller is concerned: the fallback is LU, not a fix to the
+    // calling code.
+    let indefinite = LaNotPositiveDefinite(at: 1, value: -1.0)
+    test.assert_eq(lafault.is_shape_fault(indefinite), false)
+    test.assert_eq(lafault.is_singular_fault(indefinite), true)
+    test.assert_eq(lafault.is_convergence_fault(indefinite), false)
+    let unconverged = LaNoConvergence(sweeps: 30, residual: 1e-3)
+    test.assert_eq(lafault.is_shape_fault(unconverged), false)
+    test.assert_eq(lafault.is_singular_fault(unconverged), false)
+    test.assert_eq(lafault.is_convergence_fault(unconverged), true)
+    // A tolerance and a norm order are neither: the calling code is
+    // wrong, but no reshape and no other factorisation fixes them.
+    let tol = LaBadTolerance(tolerance: -1.0)
+    test.assert_eq(lafault.is_shape_fault(tol), false)
+    test.assert_eq(lafault.is_singular_fault(tol), false)
+    test.assert_eq(lafault.is_convergence_fault(tol), false)
+    let order = LaBadNormOrder(p: 0.5)
+    test.assert_eq(lafault.is_shape_fault(order), false)
+    test.assert_eq(lafault.is_singular_fault(order), false)
+    test.assert_eq(lafault.is_convergence_fault(order), false)
+
+@test
+fn test_each_entry_point_raises_its_own_shape_refusal()
+    // The shape checks live in helpers shared by whole modules, so one
+    // wrong-typed argument per entry point is what proves each of them
+    // is wired to a check at all — and the sentence names the entry
+    // point, which is what tells a caller which of their calls went
+    // wrong rather than that one of them did.
+    match ndfloat.eye(2)
+        Ok(i2) =>
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match lalu.factor(v2)
+                        Ok(_)  => test.fail("a vector is not a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lalu.factor wants a matrix and got an array of rank 1")
+                    match lalu.factor(i2)
+                        Ok(lu) =>
+                            match lalu.solve(lu, i2)
+                                Ok(_)  => test.fail("a vector solve wants a vector")
+                                Err(e) => test.assert_eq_str(e.message(),
+                                    "linalg: lalu.solve wants a vector and got an array of rank 2")
+                            match lalu.solve_matrix(lu, v2)
+                                Ok(_)  => test.fail("a matrix solve wants a matrix")
+                                Err(e) => test.assert_eq_str(e.message(),
+                                    "linalg: lalu.solve_matrix wants a matrix and got an array of rank 1")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // Three rows cannot be solved for two unknowns.
+            match ndfloat.zeros([3, 2])
+                Ok(t3) =>
+                    match lalu.factor(i2)
+                        Ok(lu) =>
+                            match lalu.solve_matrix(lu, t3)
+                                Ok(_)  => test.fail("three rows cannot be solved against two unknowns")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // ── Cholesky ────────────────────────────────────────
+            match ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])
+                Ok(spd) =>
+                    // Bound here rather than reused from the arm above:
+                    // the two are in different arms, and nova's arms do
+                    // not share bindings.
+                    let vch = ndfloat.of_list([1.0, 2.0], [2])!
+                    match lachol.factor(vch)
+                        Ok(_)  => test.fail("a vector is not a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lachol.factor wants a matrix and got an array of rank 1")
+                    match lachol.factor(spd)
+                        Ok(c)  =>
+                            match lachol.solve(c, i2)
+                                Ok(_)  => test.fail("a vector solve wants a vector")
+                                Err(e) => test.assert_eq_str(e.message(),
+                                    "linalg: lachol.solve wants a vector and got an array of rank 2")
+                            match lachol.solve(c, ndfloat.zeros([3])!)
+                                Ok(_)  => test.fail("a 2 by 2 system wants 2 entries")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                            match lachol.solve_matrix(c, vch)
+                                Ok(_)  => test.fail("a matrix solve wants a matrix")
+                                Err(e) => test.assert_eq_str(e.message(),
+                                    "linalg: lachol.solve_matrix wants a matrix and got an array of rank 1")
+                        Err(e) => test.fail(e.message())
+                Err(e)  => test.fail(e.message())
+            // Three rows cannot be solved for two unknowns here either.
+            match ndfloat.zeros([3, 2])
+                Ok(t3) =>
+                    match lachol.factor(ndfloat.of_list([4.0, 2.0, 2.0, 3.0], [2, 2])!)
+                        Ok(c)  =>
+                            match lachol.solve_matrix(c, t3)
+                                Ok(_)  => test.fail("three rows cannot be solved against two unknowns")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // ── QR ──────────────────────────────────────────────
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match laqr.factor(v2)
+                        Ok(_)  => test.fail("a vector is not a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: laqr.factor wants a matrix and got an array of rank 1")
+                Err(e) => test.fail(e.message())
+            match ndfloat.zeros([0, 0])
+                Ok(empty) =>
+                    match laqr.factor(empty)
+                        Ok(_)  => test.fail("an empty matrix has no Householder factorisation")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 0 by 0 matrix has no factorisation")
+                Err(e)    => test.fail(e.message())
+            match ndfloat.of_list([3.0, 4.0], [2])
+                Ok(v2) =>
+                    match laqr.factor(i2)
+                        Ok(qr) =>
+                            // A rank-3 array is neither one right-hand
+                            // side nor a matrix of them.
+                            match ndfloat.zeros([2, 2, 2])
+                                Ok(cube) =>
+                                    match laqr.apply_q(qr, cube)
+                                        Ok(_)  => test.fail("Q is applied to a vector or a matrix")
+                                        Err(e) => test.assert_eq_str(e.message(),
+                                            "linalg: laqr.apply_q wants a matrix and got an array of rank 3")
+                                Err(e)   => test.fail(e.message())
+                            // And a vector of the wrong length is the
+                            // other half of the same check.
+                            match laqr.apply_q(qr, ndfloat.zeros([3])!)
+                                Ok(_)  => test.fail("a 2 by 2 reflector wants 2 entries")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // ── the eigenproblem ────────────────────────────────
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match laeig.factor(v2)
+                        Ok(_)  => test.fail("a vector is not a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: laeig.factor_with_sweeps wants a matrix and got an array of rank 1")
+                Err(e) => test.fail(e.message())
+            match ndfloat.zeros([0, 0])
+                Ok(empty) =>
+                    match laeig.factor(empty)
+                        Ok(_)  => test.fail("an empty matrix has no eigendecomposition")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 0 by 0 matrix has no factorisation")
+                Err(e)    => test.fail(e.message())
+            // ── the SVD ────────────────────────────────────────
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match lasvd.factor(v2)
+                        Ok(_)  => test.fail("a vector is not a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lasvd.factor_with_sweeps wants a matrix and got an array of rank 1")
+                Err(e) => test.fail(e.message())
+            match ndfloat.zeros([0, 0])
+                Ok(empty) =>
+                    match lasvd.factor(empty)
+                        Ok(_)  => test.fail("an empty matrix has no singular values")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 0 by 0 matrix has no factorisation")
+                Err(e)    => test.fail(e.message())
+            match ndfloat.of_list([1.0, 0.0, 0.0, 1.0], [2, 2])
+                Ok(a)  =>
+                    match lasvd.factor(a)
+                        Ok(s)  =>
+                            // A matrix where a vector is wanted, and a
+                            // vector of the wrong length: the two
+                            // halves of the right-hand side check.
+                            match lasvd.lstsq(s, i2, 1e-12)
+                                Ok(_)  => test.fail("a least-squares right-hand side is a vector")
+                                Err(e) => test.assert_eq_str(e.message(),
+                                    "linalg: lasvd.lstsq wants a vector and got an array of rank 2")
+                            match lasvd.lstsq(s, ndfloat.zeros([3])!, 1e-12)
+                                Ok(_)  => test.fail("a 2 by 2 fit wants 2 responses")
+                                Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // ── the norms ──────────────────────────────────────
+            match ndfloat.of_list([3.0, 4.0], [2])
+                Ok(v2) =>
+                    match lanorm.norm(v2, LaNorm1)
+                        Ok(_)  => test.fail("a matrix norm wants a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lanorm.norm wants a matrix and got an array of rank 1")
+                    match lanorm.dot(v2, ndfloat.zeros([3])!)
+                        Ok(_)  => test.fail("a dot product wants two vectors of one length")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                Err(e) => test.fail(e.message())
+            match ndfloat.zeros([2, 3])
+                Ok(wide) =>
+                    match lanorm.trace(wide)
+                        Ok(_)  => test.fail("a trace wants a square matrix")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 2 by 3 matrix is not square")
+                Err(e)   => test.fail(e.message())
+            // ── the one-shot forms ─────────────────────────────
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match lasolve.solve(v2, v2)
+                        Ok(_)  => test.fail("a solve wants a matrix")
+                        // The one-shot form delegates, so the refusal
+                        // names the call that actually looked: the
+                        // factorisation.  That is the honest name —
+                        // the sentence says what was refused, not who
+                        // asked.
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lalu.factor wants a matrix and got an array of rank 1")
+                Err(e) => test.fail(e.message())
+            match ndfloat.zeros([2, 3])
+                Ok(wide) =>
+                    match lasolve.solve(wide, ndfloat.of_list([1.0, 2.0], [2])!)
+                        Ok(_)  => test.fail("a solve wants a square matrix")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 2 by 3 matrix is not square")
+                Err(e)   => test.fail(e.message())
+            match ndfloat.eye(2)
+                Ok(a)  =>
+                    match lasolve.solve(a, a)
+                        Ok(_)  => test.fail("a solve wants a vector")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lalu.solve wants a vector and got an array of rank 2")
+                    match lasolve.solve(a, ndfloat.zeros([3])!)
+                        Ok(_)  => test.fail("a 2 by 2 system wants 2 entries")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_three_by_three_cholesky_by_hand_and_the_eigenproblem_beside_it()
+    // L is written out entry by entry: L = [[2,0,0],[6,1,0],[-8,5,3]],
+    // which is L Lᵀ = A exactly — every entry here is an exact square
+    // root of an exact integer, so the factor is asserted entry for
+    // entry rather than within a tolerance.  det A = (2*1*3)² = 36.
+    match ndfloat.of_list([4.0, 12.0, -16.0, 12.0, 37.0, -43.0, -16.0, -43.0, 98.0], [3, 3])
+        Ok(a)  =>
+            match lachol.factor(a)
+                Ok(c)  =>
+                    test.assert_eq(ndfloat.to_list(lachol.lower(c)),
+                        [2.0, 0.0, 0.0, 6.0, 1.0, 0.0, -8.0, 5.0, 3.0])
+                    test.assert_eq(lachol.determinant(c), 36.0)
+                    // ln 36 to well past what a test needs to know.
+                    test.assert_approx(lachol.log_determinant(c), 3.58351893845611, 1e-12)
+                    // And the factor's own product is A, which the
+                    // reconstruction owes whatever the hand values say.
+                    test.assert(defect(lachol.reconstruct(c), a) < 1e-12)
+                Err(e) => test.fail(e.message())
+            test.assert_eq(lachol.is_positive_definite(a), true)
+        Err(e) => test.fail(e.message())
+    // The 3 by 3 symmetric tridiagonal with 2 on the diagonal and 1 off
+    // it: p(λ) = (2-λ)((2-λ)² - 2), whose roots are 2 and 2 ± √2.  The
+    // polynomial is written here rather than taken from the package, so
+    // plugging the values back in is a check that does not use the
+    // factorisation to check itself.
+    match ndfloat.of_list([2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0], [3, 3])
+        Ok(a)  =>
+            match laeig.factor(a)
+                Ok(e)  =>
+                    let w = ndfloat.to_list(laeig.values(e))
+                    test.assert_eq(list.len(w), 3)
+                    // Descending, as the module documents.
+                    test.assert(w[0] > w[1] and w[1] > w[2])
+                    test.assert_approx(w[0], 2.0 + math.sqrt(2.0), 1e-12)
+                    test.assert_approx(w[1], 2.0, 1e-12)
+                    test.assert_approx(w[2], 2.0 - math.sqrt(2.0), 1e-12)
+                    // The trace and the determinant, by hand: 6 and 4.
+                    test.assert_approx(w[0] + w[1] + w[2], 6.0, 1e-12)
+                    test.assert_approx(w[0] * w[1] * w[2], 4.0, 1e-12)
+                    // And each one is a root of the characteristic
+                    // polynomial, which is the hand-written statement
+                    // of what an eigenvalue is.
+                    for k in 0..3
+                        let lam = w[k]
+                        let d = 2.0 - lam
+                        test.assert_approx(d * (d * d - 2.0), 0.0, 1e-12)
+                    test.assert(defect(laeig.reconstruct(e), a) < 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_degenerate_spectrum_answers_with_the_numbers_on_either_side_of_it()
+    // [[1,0],[0,0]] has a zero eigenvalue exactly, and the three
+    // questions the module answers about a spectrum each have an answer
+    // here that a float comparison can state exactly.
+    match ndfloat.of_list([1.0, 0.0, 0.0, 0.0], [2, 2])
+        Ok(a)  =>
+            match laeig.factor(a)
+                Ok(e)  =>
+                    // The condition number is the largest |eigenvalue|
+                    // over the smallest, and the smallest is zero: the
+                    // refusal to divide is an infinity, not a NaN.
+                    test.assert_eq(ndfloat.to_list(laeig.values(e)), [1.0, 0.0])
+                    test.assert_eq(laeig.condition(e), math.infinity())
+                    test.assert_eq(laeig.spectral_radius(e), 1.0)
+                    match laeig.inertia(e, 1e-10)
+                        Ok(inertia) =>
+                            test.assert_eq(inertia.positive, 1)
+                            test.assert_eq(inertia.zero, 1)
+                            test.assert_eq(inertia.negative, 0)
+                        Err(f)      => test.fail(f.message())
+                    // A negative power of a zero eigenvalue is not a
+                    // number this can hand back, and it says which one.
+                    match laeig.power(e, -1.0)
+                        Ok(_)  => test.fail("zero to a negative power is not real")
+                        Err(f) => test.assert_eq_str(f.message(), "linalg: not positive definite at position 1, value 0")
+                    // A positive integral power is fine, and the
+                    // product is the matrix idempotent under it.
+                    match laeig.power(e, 2.0)
+                        Ok(p2) =>
+                            let want = ndfloat.of_list([1.0, 0.0, 0.0, 0.0], [2, 2])!
+                            test.assert(defect(p2, want) < 1e-12)
+                        Err(f) => test.fail(f.message())
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_estimator_stops_when_a_column_stops_beating_the_best()
+    // A = [[-3,-1,0],[2,1,-1],[0,1,0]].  By hand: det = -3, so
+    // A⁻¹ = [[-1/3,0,-1/3],[0,0,1],[-2/3,-1,1/3]], whose columns sum to
+    // 1, 1 and 5/3 in absolute value.  So the true 1-norm condition
+    // number is 5 * 5/3 = 25/3, and the estimator's job is to come in
+    // UNDER that honestly rather than over it.
+    match ndfloat.of_list([-3.0, -1.0, 0.0, 2.0, 1.0, -1.0, 0.0, 1.0, 0.0], [3, 3])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    let anorm = lanorm.norm(a, LaNorm1)!
+                    test.assert_approx(anorm, 5.0, 1e-12)
+                    let inv = lalu.inverse(lu)!
+                    let true_cond = anorm * lanorm.norm(inv, LaNorm1)!
+                    test.assert_approx(true_cond, 25.0 / 3.0, 1e-12)
+                    let est = lanorm.condition_estimate(lu, anorm)
+                    // The estimate is a lower bound, and never an
+                    // overshoot: the first column that fails to beat
+                    // the best already seen ends the iteration.
+                    test.assert(est <= true_cond + 1e-12)
+                    test.assert_approx(est, 5.0, 1e-12)
+                    // An `anorm` below one floor the product could have
+                    // is lifted to 1, which is the identity's condition
+                    // number and the smallest value the product can take.
+                    test.assert_eq(lanorm.condition_estimate(lu, 0.0), 1.0)
+                    test.assert_eq(lanorm.condition_estimate(lu, 0.5), 1.0)
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_svd_of_a_tall_matrix_and_of_one_with_an_orthogonal_pair()
+    // The 3 by 3 has an exactly orthogonal first column pair — (2,0,0)
+    // with (0,2,0) — while the third column keeps the sweep going, so
+    // the rotation that finds nothing to do is met rather than skipped.
+    match ndfloat.of_list([2.0, 0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 0.0, 1.0], [3, 3])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    let sv = ndfloat.to_list(lasvd.singular_values(s))
+                    test.assert_approx(sv[1], 2.0, 1e-12)
+                    test.assert(defect(lasvd.reconstruct(s), a) < 1e-12)
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+    // The tall one: 3 rows, 2 columns, so `u_full` has real work to do —
+    // the thin `U` has 2 columns and the full one 3 — and the published
+    // rank tolerance takes the LARGER extent, which is the row count.
+    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])
+        Ok(a)  =>
+            match lasvd.factor(a)
+                Ok(s)  =>
+                    test.assert_eq(lasvd.rows(s), 3)
+                    test.assert_eq(lasvd.cols(s), 2)
+                    test.assert_eq(lasvd.count(s), 2)
+                    let uf = lasvd.u_full(s)
+                    let dims = ndfloat.shape(uf).dims
+                    test.assert_eq(list.len(dims), 2)
+                    test.assert_eq(list.get(dims, 0), 3)
+                    test.assert_eq(list.get(dims, 1), 3)
+                    // A full U is orthogonal, which the thin one is not
+                    // allowed to be, and this asks the package's own
+                    // orthogonality measure rather than a hand roll.
+                    test.assert(lanorm.orthogonality_defect(uf)! < 1e-12)
+                    // A = U Σ Vᵀ with the full U, which is the whole of
+                    // what `u_full` is for: k = 2 columns carry Σ.
+                    let us = ndfloat.to_list(uf)
+                    let vs = ndfloat.to_list(lasvd.v(s))
+                    let sv = ndfloat.to_list(lasvd.singular_values(s))
+                    var worst = 0.0
+                    var i = 0
+                    while i < 3
+                        var j = 0
+                        while j < 2
+                            var acc = 0.0
+                            for p in 0..2
+                                acc = acc + us[i * 3 + p] * sv[p] * vs[p * 2 + j]
+                            let want = ndfloat.to_list(a)
+                            acc = math.abs(acc - want[i * 2 + j])
+                            if acc > worst
+                                worst = acc
+                            j = j + 1
+                        i = i + 1
+                    test.assert(worst < 1e-12)
+                    // numpy's rule, computed by hand from the formula
+                    // the doc block prints: max(m, n) * eps * s[0].
+                    let values = ndfloat.to_list(lasvd.singular_values(s))
+                    let want_tol = 3.0 * 2.220446049250313e-16 * values[0]
+                    test.assert_approx(lasvd.default_rank_tolerance(s), want_tol, 1e-18)
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_reflector_that_starts_from_a_negative_leading_entry()
+    // [[-1,2],[3,4]]: the first column's leading entry is negative, so
+    // the reflector's `alpha` takes the sign the sum-of-magnitudes
+    // wants rather than the difference.  The factor is checked against
+    // the product the same way every other one is.
+    match ndfloat.of_list([-1.0, 2.0, 3.0, 4.0], [2, 2])
+        Ok(a)  =>
+            match laqr.factor(a)
+                Ok(qr) =>
+                    test.assert(defect(laqr.reconstruct(qr), a) < 1e-12)
+                    let q = laqr.q(qr)
+                    test.assert(lanorm.orthogonality_defect(q)! < 1e-12)
+                    // R is upper triangular, below the diagonal exactly.
+                    let r = ndfloat.to_list(laqr.r(qr))
+                    test.assert_eq(r[2], 0.0)
+                    // Applying Q to a MATRIX is the other branch of the
+                    // shape check, and the answer must agree with the
+                    // materialised Q.
+                    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0], [2, 2])
+                        Ok(m)  =>
+                            let qm = laqr.apply_q(qr, m)!
+                            test.assert(defect(qm, ndfloat.matmul(q, m)!) < 1e-12)
+                            let qtm = laqr.apply_q_transpose(qr, m)!
+                            let qt = ndfloat.transpose(q)
+                            test.assert(defect(qtm, ndfloat.matmul(qt, m)!) < 1e-12)
+                            // A matrix with the wrong number of rows is
+                            // refused rather than reshaped.
+                            match laqr.apply_q(qr, ndfloat.zeros([3, 2])!)
+                                Ok(_)  => test.fail("a 2 by 2 reflector wants 2 rows")
+                                Err(f) => test.assert_eq_str(f.message(), "linalg: the operand has 3 where 2 was wanted")
+                            // And a least-squares fit wants one response
+                            // per row, not a matrix of them: this is the
+                            // check the vector reader owns.
+                            match laqr.lstsq(qr, m)
+                                Ok(_)  => test.fail("a least-squares right-hand side is a vector")
+                                Err(f) => test.assert_eq_str(f.message(),
+                                    "linalg: laqr.lstsq wants a vector and got an array of rank 2")
+                        Err(f) => test.fail(f.message())
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_triangular_solvers_refuse_what_they_cannot_read()
+    // `lalu`/`lachol` never touch their own shape helpers — they are
+    // reached through the one-shot forms and the two triangular
+    // solvers, which are the pair a caller hands a matrix to.
+    match ndfloat.eye(2)
+        Ok(i2) =>
+            match ndfloat.of_list([1.0, 2.0], [2])
+                Ok(v2) =>
+                    match lasolve.solve_lower(v2, v2)
+                        Ok(_)  => test.fail("a triangular solve wants a matrix")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lasolve.solve_lower wants a matrix and got an array of rank 1")
+                    match lasolve.solve_lower(ndfloat.zeros([2, 3])!, v2)
+                        Ok(_)  => test.fail("a triangular solve wants a square matrix")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: a 2 by 3 matrix is not square")
+                    match lasolve.solve_upper(i2, i2)
+                        Ok(_)  => test.fail("a triangular solve wants a vector")
+                        Err(e) => test.assert_eq_str(e.message(),
+                            "linalg: lasolve.solve_upper wants a vector and got an array of rank 2")
+                    match lasolve.solve_upper(i2, ndfloat.zeros([3])!)
+                        Ok(_)  => test.fail("a 2 by 2 system wants 2 entries")
+                        Err(e) => test.assert_eq_str(e.message(), "linalg: the operand has 3 where 2 was wanted")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_hand_built_factor_answers_what_its_own_construction_asks()
+    // `lalu.factor` refuses a singular matrix, so the zero on `U`'s
+    // diagonal that `log_abs_determinant` and `inverse` both document
+    // cannot come from it.  It can come from a caller: `LaLu`'s fields
+    // are public and the struct is the published shape of a factor, so
+    // a caller assembling one (or reading one out of a file) is a
+    // caller this has to answer rather than crash on.  packed is
+    // [[1,1],[0,0]]: U's second diagonal entry is a zero.
+    let lu = LaLu { packed: ndfloat.of_list([1.0, 1.0, 0.0, 0.0], [2, 2])!, pivots: [0, 1], swaps: 0 }
+    test.assert_eq(lalu.order(lu), 2)
+    let d = lalu.log_abs_determinant(lu)
+    // A determinant of zero has no sign and no finite log, and the
+    // struct carries both facts rather than one NaN.
+    test.assert_eq(d.sign, 0.0)
+    test.assert_eq(d.log_abs, 0.0 - math.infinity())
+    test.assert_eq(lalu.determinant(lu), 0.0)
+    match lalu.inverse(lu)
+        Ok(_)  => test.fail("a zero on U's diagonal has no inverse")
+        Err(e) => test.assert_eq_str(e.message(), "linalg: singular at column 1, pivot 0")
+    // An order-zero factor is the empty matrix, whose condition number
+    // is the floor: there is no column to divide by, so the estimate
+    // is the identity's 1 rather than an infinity or a crash.
+    let empty = LaLu { packed: ndfloat.of_list([], [0, 0])!, pivots: [], swaps: 0 }
+    test.assert_eq(lalu.order(empty), 0)
+    test.assert_eq(lanorm.condition_estimate(empty, 0.0), 1.0)
+
+@test
+fn test_the_reconstruction_undoes_the_pivots_the_factorisation_made()
+    // The identity matrix swaps nothing, so a reconstruction checked
+    // only against it never undoes a swap.  These two do: [[0,1],[1,0]]
+    // has no other choice, and [[1,2,3],[4,5,6],[7,8,10]] swaps without
+    // a zero in sight, because partial pivoting takes the column's
+    // largest entry — row 2 — and the permutation has to be undone
+    // afterwards for the product to be the matrix again.
+    match ndfloat.of_list([0.0, 1.0, 1.0, 0.0], [2, 2])
+        Ok(swap) =>
+            match lalu.factor(swap)
+                Ok(lu) =>
+                    test.assert_eq(lalu.permutation_indices(lu), [1, 0])
+                    test.assert_eq(ndfloat.to_list(lalu.permutation(lu)), [0.0, 1.0, 1.0, 0.0])
+                    test.assert(defect(lalu.reconstruct(lu), swap) < 1e-12)
+                    // `P A = L U` is the identity the factors owe, and
+                    // it holds whatever the pivot order did.
+                    let pa = ndfloat.matmul(lalu.permutation(lu), swap)!
+                    let prod = ndfloat.matmul(lalu.lower(lu), lalu.upper(lu))!
+                    test.assert(defect(pa, prod) < 1e-12)
+                    // And the swap reaches the right-hand side too.
+                    let x = lalu.solve(lu, ndfloat.of_list([1.0, 0.0], [2])!)!
+                    test.assert(defect(x, ndfloat.of_list([0.0, 1.0], [2])!) < 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e)   => test.fail(e.message())
+    match ndfloat.of_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0], [3, 3])
+        Ok(a)  =>
+            match lalu.factor(a)
+                Ok(lu) =>
+                    // By hand: det = 1(50-48) - 2(40-42) + 3(32-35) = -3,
+                    // with the permutation's sign included.
+                    test.assert_approx(lalu.determinant(lu), -3.0, 1e-12)
+                    test.assert(defect(lalu.reconstruct(lu), a) < 1e-12)
+                    let pa = ndfloat.matmul(lalu.permutation(lu), a)!
+                    let prod = ndfloat.matmul(lalu.lower(lu), lalu.upper(lu))!
+                    test.assert(defect(pa, prod) < 1e-12)
+                    // The permutation is not the identity here, which is
+                    // the whole point of the case.
+                    let perm = lalu.permutation_indices(lu)
+                    test.assert(perm[0] != 0 or perm[1] != 1 or perm[2] != 2)
+                    // A solve through the same pivots still lands on the
+                    // right-hand side.
+                    let b = ndfloat.of_list([1.0, 2.0, 3.0], [3])!
+                    let x = lalu.solve(lu, b)!
+                    test.assert(defect(ndfloat.matmul(a, x)!, b) < 1e-12)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())

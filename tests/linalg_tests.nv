@@ -2,12 +2,6 @@
 // by hand, the identities every decomposition owes, and the two
 // disagreements with numpy that are deliberate.
 //
-// They COMPILE today and they FAIL at run, with `not implemented:
-// linalg-nv.<module>.<fn>` from the `todo()` that is each body.  That
-// is the expected state of an interface release: the compiler has
-// checked every signature, every type and every effect row, and nothing
-// else has been checked because there is nothing else yet.
-//
 // WHERE THE VECTORS COME FROM.  A decomposition of an arbitrary matrix
 // is not unique — `Q`'s column signs, an eigenvector's direction and a
 // singular vector's sign are all free — so a suite that hard-coded

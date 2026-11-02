@@ -1,9 +1,6 @@
 // lachol — the Cholesky factorisation, which is the fast path for the
 // matrices statistics and optimisation actually produce.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT IT IS.  `A = L Lᵀ` for a symmetric positive-definite `A`, with
 // `L` lower triangular and positive on its diagonal.  Half the work of
 // LU (`n³/6` against `n³/3`), half the storage, no pivoting needed, and
@@ -40,6 +37,98 @@
 // sure.
 
 use ndfloat
+use lafault
+
+// ── the shapes, and the buffers the arithmetic runs on ──────────────
+//
+// Each module in this package carries its own copy of these few-line
+// helpers, the way `stats-nv`'s modules each carry an `array_of`: a
+// module's private functions are its own business, and the shape a
+// decomposition refuses is best read beside the decomposition.
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.  A zero dimension is refused here rather than later:
+// every decomposition of an empty matrix is defensible and none of
+// them is useful.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows == 0 or cols == 0
+        return Err(LaEmptyMatrix(rows, cols))
+    Ok(dims[:])
+
+// The extents of a square matrix, or the refusal that says why it is
+// not one.
+fn square_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = matrix_dims(a, what)!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    Ok(dims)
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// A flat row-major `n`-by-`n` identity.
+fn identity(n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        out[i * n + i] = 1.0
+        i = i + 1
+    out
+
+// An array over a flat list at these dims.  Every caller here builds
+// the list to the length the dims describe, so the array underneath
+// had nothing to refuse.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The product of two flat row-major `n`-by-`n` matrices.
+fn mul_square(x: [Float], y: [Float], n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = 0
+        while j < n
+            var s = 0.0
+            var k = 0
+            while k < n
+                s = s + x[i * n + k] * y[k * n + j]
+                k = k + 1
+            out[i * n + j] = s
+            j = j + 1
+        i = i + 1
+    out
+
+// The length of a vector operand, or the refusal that says why it is
+// not one of the length the factors need.
+fn vector_of(b: NdFloat, n: Int, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(b)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    let xs = ndfloat.to_list(b)
+    if list.len(xs) != n
+        return Err(LaDimensionMismatch(n, list.len(xs)))
+    Ok(xs)
+
+// The column count of a matrix operand that has `n` rows, or the
+// refusal that says why it is not the shape the factors need.
+fn columns_of(b: NdFloat, n: Int, what: Str) -> Result<Int, LaFault>
+    let r = ndfloat.rank(b)
+    if r != 2
+        return Err(LaNotMatrix(what, r))
+    let dims = ndfloat.shape(b).dims
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != n
+        return Err(LaDimensionMismatch(n, rows))
+    Ok(cols)
 
 // LaChol is the Cholesky factorisation of a symmetric positive-definite
 // matrix.
@@ -73,7 +162,37 @@ pub struct LaChol
 // `LaNotPositiveDefinite` with the position and the value when a
 // diagonal entry is not positive after the elimination so far.
 pub fn factor(a: NdFloat) -> Result<LaChol, LaFault> []
-    todo("linalg-nv.lachol.factor")
+    let dims = square_dims(a, "lachol.factor")!
+    let n = list.get(dims, 0)
+    let src = ndfloat.to_list(a)
+    var l = zeros(n * n)
+    var j = 0
+    while j < n
+        // The diagonal of a Cholesky factor is a square root, and a
+        // square root whose argument is not positive is the whole of
+        // the positive-definite test: the matrix is not one.
+        var d = src[j * n + j]
+        var k = 0
+        while k < j
+            d = d - l[j * n + k] * l[j * n + k]
+            k = k + 1
+        if d <= 0.0
+            return Err(LaNotPositiveDefinite(j, d))
+        let root = math.sqrt(d)
+        l[j * n + j] = root
+        // The column below the diagonal, which is the only place the
+        // upper triangle of `a` would have been read.
+        var i = j + 1
+        while i < n
+            var s = src[i * n + j]
+            var k2 = 0
+            while k2 < j
+                s = s - l[i * n + k2] * l[j * n + k2]
+                k2 = k2 + 1
+            l[i * n + j] = s / root
+            i = i + 1
+        j = j + 1
+    Ok(LaChol { lower: array_of(l, dims), n: n })
 
 // Whether the matrix is symmetric positive-definite, by trying to
 // factor it.
@@ -94,15 +213,17 @@ pub fn factor(a: NdFloat) -> Result<LaChol, LaFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn is_positive_definite(a: NdFloat) -> Bool []
-    todo("linalg-nv.lachol.is_positive_definite")
+    match factor(a)
+        Ok(_)  => true
+        Err(_) => false
 
 // How many rows the factored matrix had.
 pub fn order(c: LaChol) -> Int []
-    todo("linalg-nv.lachol.order")
+    c.n
 
 // The lower-triangular factor `L`.
 pub fn lower(c: LaChol) -> NdFloat []
-    todo("linalg-nv.lachol.lower")
+    c.lower
 
 // The upper-triangular factor `Lᵀ`, which is the same numbers
 // transposed.
@@ -111,18 +232,65 @@ pub fn lower(c: LaChol) -> NdFloat []
 // `A = Uᵀ U` and a reader translating a formula should not have to
 // transpose by hand and wonder whether they got it right.
 pub fn upper(c: LaChol) -> NdFloat []
-    todo("linalg-nv.lachol.upper")
+    ndfloat.transpose(c.lower)
+
+// `L y` and `Lᵀ x`, in one pass each.
+//
+// Forward substitution through `L` is the solve; the same loop without
+// the division is `apply_lower`.  Written once here so that `solve`,
+// `solve_matrix`, `inverse` and `apply_lower` are one line each.
+fn forward(l: [Float], n: Int, b: [Float]) -> [Float]
+    var y = zeros(n)
+    for i in 0..n
+        var s = b[i]
+        for j in 0..i
+            s = s - l[i * n + j] * y[j]
+        y[i] = s / l[i * n + i]
+    y
+
+// Back substitution through `Lᵀ`, which is the second half of a
+// Cholesky solve.
+fn backward(l: [Float], n: Int, y: [Float]) -> [Float]
+    var x = y[:]
+    var i = n - 1
+    while i >= 0
+        var s = x[i]
+        for j in i + 1..n
+            s = s - l[j * n + i] * x[j]
+        x[i] = s / l[i * n + i]
+        i = i - 1
+    x
 
 // `x` such that `A x = b`.
 //
 // LAPACK `dpotrs`.  Forward substitution through `L`, back
 // substitution through `Lᵀ`, at `n²`.
 pub fn solve(c: LaChol, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lachol.solve")
+    let n = c.n
+    let rhs = vector_of(b, n, "lachol.solve")!
+    let l = ndfloat.to_list(c.lower)
+    let y = forward(l, n, rhs)
+    let x = backward(l, n, y)
+    Ok(array_of(x, [n]))
 
 // `X` such that `A X = B`, for several right-hand sides at once.
 pub fn solve_matrix(c: LaChol, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lachol.solve_matrix")
+    let n = c.n
+    let cols = columns_of(b, n, "lachol.solve_matrix")!
+    let flat = ndfloat.to_list(b)
+    let l = ndfloat.to_list(c.lower)
+    var out = zeros(n * cols)
+    var j = 0
+    while j < cols
+        var col = zeros(n)
+        for i in 0..n
+            col[i] = flat[i * cols + j]
+        let y = forward(l, n, col)
+        let x = backward(l, n, y)
+        for i in 0..n
+            out[i * cols + j] = x[i]
+        j = j + 1
+    Ok(array_of(out, [n, cols]))
 
 // The inverse of the factored matrix.
 //
@@ -132,7 +300,9 @@ pub fn solve_matrix(c: LaChol, b: NdFloat) -> Result<NdFloat, LaFault> []
 // is the precision matrix, and its ENTRIES are the thing a
 // statistical model reports.
 pub fn inverse(c: LaChol) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lachol.inverse")
+    let n = c.n
+    let e = array_of(identity(n), [n, n])
+    solve_matrix(c, e)
 
 // The determinant: the square of the product of `L`'s diagonal.
 //
@@ -140,7 +310,14 @@ pub fn inverse(c: LaChol) -> Result<NdFloat, LaFault> []
 // — which is itself a useful check on a caller who thought their matrix
 // was one.
 pub fn determinant(c: LaChol) -> Float []
-    todo("linalg-nv.lachol.determinant")
+    let n = c.n
+    let l = ndfloat.to_list(c.lower)
+    var d = 1.0
+    var i = 0
+    while i < n
+        d = d * l[i * n + i] * l[i * n + i]
+        i = i + 1
+    d
 
 // The natural logarithm of the determinant: twice the sum of the
 // logarithms of `L`'s diagonal.
@@ -150,7 +327,14 @@ pub fn determinant(c: LaChol) -> Float []
 // matrix is a sum of 500 logarithms here and an overflow every other
 // way.  No sign is needed, because there is no sign.
 pub fn log_determinant(c: LaChol) -> Float []
-    todo("linalg-nv.lachol.log_determinant")
+    let n = c.n
+    let l = ndfloat.to_list(c.lower)
+    var s = 0.0
+    var i = 0
+    while i < n
+        s = s + math.log(l[i * n + i])
+        i = i + 1
+    2.0 * s
 
 // `L y` for a vector `y` — the transform that turns standard normal
 // samples into samples from a covariance.
@@ -161,11 +345,31 @@ pub fn log_determinant(c: LaChol) -> Float []
 // named here is what stops it being written slightly differently in
 // four places.
 pub fn apply_lower(c: LaChol, y: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lachol.apply_lower")
+    let n = c.n
+    let ys = vector_of(y, n, "lachol.apply_lower")!
+    let l = ndfloat.to_list(c.lower)
+    var out = zeros(n)
+    for i in 0..n
+        var s = 0.0
+        for j in 0..i + 1
+            s = s + l[i * n + j] * ys[j]
+        out[i] = s
+    Ok(array_of(out, [n]))
 
 // The product `L Lᵀ` — the original matrix's lower triangle,
 // reconstructed, with the upper triangle filled in symmetrically.
 //
 // The round trip every decomposition owes.
 pub fn reconstruct(c: LaChol) -> NdFloat []
-    todo("linalg-nv.lachol.reconstruct")
+    let n = c.n
+    let l = ndfloat.to_list(c.lower)
+    var t = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = 0
+        while j < n
+            t[j * n + i] = l[i * n + j]
+            j = j + 1
+        i = i + 1
+    let prod = mul_square(l, t, n)
+    array_of(prod, [n, n])

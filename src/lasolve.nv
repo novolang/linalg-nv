@@ -1,9 +1,6 @@
 // lasolve — the one-call forms, for the caller who has one matrix and
 // one right-hand side and is not going to come back.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHY THESE EXIST WHEN THE DECOMPOSITIONS ARE RIGHT THERE.  A caller
 // who solves one system once should not have to know what an LU
 // factorisation is, and a package that made them learn would be
@@ -26,6 +23,44 @@
 // thing they will be looking at.
 
 use ndfloat
+use lafault
+use lalu
+use lachol
+use laqr
+use lasvd
+
+// ── the shapes, which are the caller's to get wrong ─────────────────
+
+// The extents of a square matrix, or the refusal that says why it is
+// not one.
+fn square_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    Ok(dims[:])
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// An array over a flat list at these dims.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The length of a vector operand, or the refusal that says why it is
+// not one of the length the matrix needs.
+fn vector_of(b: NdFloat, n: Int, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(b)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    let xs = ndfloat.to_list(b)
+    if list.len(xs) != n
+        return Err(LaDimensionMismatch(n, list.len(xs)))
+    Ok(xs)
 
 // `x` such that `A x = b`, for a square `A`.
 //
@@ -53,7 +88,8 @@ use ndfloat
 //         Err(e) => println(e.message())
 // ```
 pub fn solve(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.solve")
+    let lu = lalu.factor(a)!
+    lalu.solve(lu, b)
 
 // `x` such that `A x = b`, for a symmetric positive-definite `A`.
 //
@@ -64,7 +100,14 @@ pub fn solve(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
 // **One shot.**  `lachol.factor` and `lachol.solve` for a repeat
 // caller.
 pub fn solve_spd(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.solve_spd")
+    let c = lachol.factor(a)!
+    // `b` may be one right-hand side or several: the factor is the
+    // same and the loop over sides costs the transpose's worth of
+    // work, so both shapes are answered here rather than refused.
+    if ndfloat.rank(b) == 2
+        lachol.solve_matrix(c, b)
+    else
+        lachol.solve(c, b)
 
 // `x` minimising `||A x - b||₂`, for a matrix with full column rank.
 //
@@ -75,7 +118,8 @@ pub fn solve_spd(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
 // which is what fitting the same design matrix to fifty response
 // vectors is.
 pub fn lstsq(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.lstsq")
+    let qr = laqr.factor(a)!
+    laqr.lstsq(qr, b)
 
 // The minimum-norm `x` minimising `||A x - b||₂`, for a matrix of any
 // rank.
@@ -89,7 +133,13 @@ pub fn lstsq(a: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
 //
 // **One shot.**  `lasvd.factor` and `lasvd.lstsq` for a repeat caller.
 pub fn lstsq_minimum_norm(a: NdFloat, b: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.lstsq_minimum_norm")
+    // The tolerance is checked before the factorisation: a negative one
+    // is the calling code's mistake and there is no reason to pay for
+    // an SVD to find out.
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let s = lasvd.factor(a)!
+    lasvd.lstsq(s, b, tolerance)
 
 // The inverse of a square matrix.
 //
@@ -103,7 +153,8 @@ pub fn lstsq_minimum_norm(a: NdFloat, b: NdFloat, tolerance: Float) -> Result<Nd
 // `LaSingular` for a singular matrix, which is the whole of what is
 // refused.
 pub fn inverse(a: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.inverse")
+    let lu = lalu.factor(a)!
+    lalu.inverse(lu)
 
 // The determinant of a square matrix.
 //
@@ -111,7 +162,8 @@ pub fn inverse(a: NdFloat) -> Result<NdFloat, LaFault> []
 // Overflows for a large matrix of large entries, which is inherent —
 // `lalu.log_abs_determinant` is the call that does not.
 pub fn determinant(a: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lasolve.determinant")
+    let lu = lalu.factor(a)!
+    Ok(lalu.determinant(lu))
 
 // The numerical rank of a matrix.
 //
@@ -122,7 +174,10 @@ pub fn determinant(a: NdFloat) -> Result<Float, LaFault> []
 // `tolerance` is absolute; `lasvd.default_rank_tolerance` is numpy's
 // rule for a caller who wants numpy's answer.
 pub fn rank(a: NdFloat, tolerance: Float) -> Result<Int, LaFault> []
-    todo("linalg-nv.lasolve.rank")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let s = lasvd.factor(a)!
+    lasvd.rank(s, tolerance)
 
 // The Moore-Penrose pseudoinverse of a matrix.
 //
@@ -130,7 +185,10 @@ pub fn rank(a: NdFloat, tolerance: Float) -> Result<Int, LaFault> []
 // transpose.  **One shot**: `lasvd.factor` and `lasvd.pseudoinverse`
 // for a repeat caller.
 pub fn pseudoinverse(a: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.pseudoinverse")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let s = lasvd.factor(a)!
+    lasvd.pseudoinverse(s, tolerance)
 
 // `x` such that `L x = b`, for a lower-triangular `L`.
 //
@@ -142,11 +200,43 @@ pub fn pseudoinverse(a: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> [
 // Only the lower triangle is read; whatever is above it is ignored
 // rather than refused.  `LaSingular` for a zero on the diagonal.
 pub fn solve_lower(l: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.solve_lower")
+    let dims = square_dims(l, "lasolve.solve_lower")!
+    let n = list.get(dims, 0)
+    let rhs = vector_of(b, n, "lasolve.solve_lower")!
+    let xs = ndfloat.to_list(l)
+    var out = zeros(n)
+    var i = 0
+    while i < n
+        let d = xs[i * n + i]
+        // A zero on the diagonal is the one thing this can refuse:
+        // there is no forward substitution past it.
+        if d == 0.0
+            return Err(LaSingular(i, 0.0))
+        var s = rhs[i]
+        for j in 0..i
+            s = s - xs[i * n + j] * out[j]
+        out[i] = s / d
+        i = i + 1
+    Ok(array_of(out, [n]))
 
 // `x` such that `U x = b`, for an upper-triangular `U`.
 //
 // Back substitution.  The other half of the pair, and only the upper
 // triangle is read.
 pub fn solve_upper(u: NdFloat, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasolve.solve_upper")
+    let dims = square_dims(u, "lasolve.solve_upper")!
+    let n = list.get(dims, 0)
+    let rhs = vector_of(b, n, "lasolve.solve_upper")!
+    let xs = ndfloat.to_list(u)
+    var out = zeros(n)
+    var i = n - 1
+    while i >= 0
+        let d = xs[i * n + i]
+        if d == 0.0
+            return Err(LaSingular(i, 0.0))
+        var s = rhs[i]
+        for j in i + 1..n
+            s = s - xs[i * n + j] * out[j]
+        out[i] = s / d
+        i = i - 1
+    Ok(array_of(out, [n]))

@@ -1,8 +1,5 @@
 // lasvd — the singular value decomposition, by one-sided Jacobi.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT IT IS.  `A = U Σ Vᵀ` for any `m x n` matrix: `U` has orthonormal
 // columns, `Σ` is diagonal and non-negative, `V` is orthogonal.  It is
 // the decomposition that works on every matrix — square or not, full
@@ -49,6 +46,369 @@
 // truncation at `k` the best rank-`k` approximation.
 
 use ndfloat
+use lafault
+
+// ── the shapes, the buffers, and one rotation ───────────────────────
+//
+// Each module in this package carries its own copy of these few-line
+// helpers, the way `stats-nv`'s modules each carry an `array_of`: a
+// module's private functions are its own business, and the rotation is
+// the one thing in this module only this module knows how to apply.
+
+// The working precision, give or take: the gap between 1.0 and the
+// next double.  A private constant because the standard library
+// publishes no such thing and the convergence threshold is a number
+// this module has to own.
+const LASVD_EPSILON = 2.220446049250313e-16
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.  A zero dimension is refused here rather than later:
+// every decomposition of an empty matrix is defensible and none of
+// them is useful.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows == 0 or cols == 0
+        return Err(LaEmptyMatrix(rows, cols))
+    Ok(dims[:])
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// An array over a flat list at these dims.  Every caller here builds
+// the list to the length the dims describe, so the array underneath
+// had nothing to refuse.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The length of a vector operand, or the refusal that says why it is
+// not one of the length the decomposition needs.
+fn vector_of(b: NdFloat, n: Int, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(b)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    let xs = ndfloat.to_list(b)
+    if list.len(xs) != n
+        return Err(LaDimensionMismatch(n, list.len(xs)))
+    Ok(xs)
+
+// The squared norm of column `j` of an `m`-by-`cols` flat matrix.
+fn column_square(w: [Float], m: Int, cols: Int, j: Int) -> Float
+    var s = 0.0
+    var i = 0
+    while i < m
+        s = s + w[i * cols + j] * w[i * cols + j]
+        i = i + 1
+    s
+
+// The inner product of columns `p` and `q`, which is the off-diagonal
+// entry of `AᵀA` that a sweep drives to zero.
+fn column_dot(w: [Float], m: Int, cols: Int, p: Int, q: Int) -> Float
+    var s = 0.0
+    var i = 0
+    while i < m
+        s = s + w[i * cols + p] * w[i * cols + q]
+        i = i + 1
+    s
+
+// The norm of the strict upper triangle of `AᵀA` — the number a sweep
+// drives to zero, and the number `LaNoConvergence` reports.
+//
+// This and not the column norms: a one-sided Jacobi iteration is
+// finished when the columns are mutually orthogonal, and the size of
+// the inner products is exactly how far from that it still is.
+fn off_norm(w: [Float], m: Int, cols: Int) -> Float
+    var s = 0.0
+    var p = 0
+    while p < cols - 1
+        var q = p + 1
+        while q < cols
+            let g = column_dot(w, m, cols, p, q)
+            s = s + g * g
+            q = q + 1
+        p = p + 1
+    math.sqrt(s)
+
+// One one-sided Jacobi rotation: the plane rotation of columns `p` and
+// `q` that makes them orthogonal, applied to the working matrix and to
+// the accumulated `V`.
+//
+// The classical form again, and for the same reason `laeig.rotate`
+// gives: `t` is the SMALLER root, taken through
+// `sign(ζ)/(|ζ| + sqrt(ζ²+1))`, so that no step is a difference of two
+// nearly equal magnitudes.  It is what keeps the small singular values
+// of a badly scaled matrix accurate, which is why this module picked
+// the algorithm at all.
+fn rotate_columns(var w: [Float], m: Int, cols: Int, p: Int, q: Int, var v: [Float], keep: Bool)
+    let alpha = column_square(w, m, cols, p)
+    let beta = column_square(w, m, cols, q)
+    let gamma = column_dot(w, m, cols, p, q)
+    if gamma == 0.0
+        return
+    let zeta = (beta - alpha) / (2.0 * gamma)
+    var t = 1.0
+    if zeta != 0.0
+        t = math.abs(zeta) + math.sqrt(zeta * zeta + 1.0)
+        if zeta < 0.0
+            t = 0.0 - t
+        t = 1.0 / t
+    let c = 1.0 / math.sqrt(1.0 + t * t)
+    let s = t * c
+    var i = 0
+    while i < m
+        let wp = w[i * cols + p]
+        let wq = w[i * cols + q]
+        w[i * cols + p] = c * wp - s * wq
+        w[i * cols + q] = s * wp + c * wq
+        i = i + 1
+    if keep
+        i = 0
+        while i < cols
+            let vp = v[i * cols + p]
+            let vq = v[i * cols + q]
+            v[i * cols + p] = c * vp - s * vq
+            v[i * cols + q] = s * vp + c * vq
+            i = i + 1
+
+// What one Jacobi run produces: the working matrix, whose columns are
+// orthogonal and whose norms are the singular values, and the
+// accumulated `V`.
+//
+// Private, because the interface publishes `LaSvd` and this is the
+// state between the arithmetic and that value.
+struct LaSvdWork
+    w: [Float]
+    v: [Float]
+    rows: Int
+    cols: Int
+
+// The one-sided Jacobi iteration itself, on a matrix with at least as
+// many rows as columns.  `keep` accumulates the right singular vectors;
+// `values_only` runs with it false and skips a column update per
+// rotation.
+fn jacobi(a: NdFloat, sweeps: Int, keep: Bool, what: Str) -> Result<LaSvdWork, LaFault>
+    let dims = matrix_dims(a, what)!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    var w = ndfloat.to_list(a)
+    var v = zeros(cols * cols)
+    var i = 0
+    while i < cols
+        v[i * cols + i] = 1.0
+        i = i + 1
+    var scale = 0.0
+    for i in 0..rows * cols
+        scale = scale + w[i] * w[i]
+    let floor = LASVD_EPSILON * cols as Float * scale
+    var off = off_norm(w, rows, cols)
+    var sweep = 0
+    while sweep < sweeps and off > floor
+        // One sweep: every pair of columns once, which is the "cyclic"
+        // in cyclic Jacobi.
+        var p = 0
+        while p < cols - 1
+            var q = p + 1
+            while q < cols
+                rotate_columns(var w, rows, cols, p, q, var v, keep)
+                q = q + 1
+            p = p + 1
+        off = off_norm(w, rows, cols)
+        sweep = sweep + 1
+    if off > floor
+        Err(LaNoConvergence(sweeps, off))
+    else
+        Ok(LaSvdWork { w: w, v: v, rows: rows, cols: cols })
+
+// The singular values descending, with the two column sets carried
+// along — the working matrix's and `V`'s.
+//
+// Private, because what the caller gets is `LaSvd`.
+struct LaSvdSorted
+    values: [Float]
+    w: [Float]
+    v: [Float]
+
+// Exchange two columns of a flat `rows`-by-`cols` matrix, in place.
+fn swap_columns(var buf: [Float], rows: Int, cols: Int, a: Int, b: Int)
+    var i = 0
+    while i < rows
+        let t = buf[i * cols + a]
+        buf[i * cols + a] = buf[i * cols + b]
+        buf[i * cols + b] = t
+        i = i + 1
+
+// The singular values descending, with the same exchange applied to
+// the working matrix's columns and to `V`'s.
+//
+// A selection sort, because the count is small, the comparison is on a
+// number, and an exchange that reached one column set and not the
+// other would pair a singular value with the wrong vector — a wrong
+// answer of exactly the kind the published order exists to prevent.
+fn sort_descending(w: [Float], v: [Float], rows: Int, cols: Int) -> LaSvdSorted
+    var values = zeros(cols)
+    for i in 0..cols
+        values[i] = math.sqrt(column_square(w, rows, cols, i))
+    var ww = w[:]
+    var vv = v[:]
+    for a in 0..cols - 1
+        var best = a
+        for b in a + 1..cols
+            if values[b] > values[best]
+                best = b
+        if best != a
+            let t = values[a]
+            values[a] = values[best]
+            values[best] = t
+            swap_columns(var ww, rows, cols, a, best)
+            swap_columns(var vv, cols, cols, a, best)
+    LaSvdSorted { values: values, w: ww, v: vv }
+
+// `min(rows, cols)` — how many singular values there are.
+fn least(rows: Int, cols: Int) -> Int
+    if rows < cols
+        rows
+    else
+        cols
+
+// Orthonormalise the columns of a flat `m`-by-`k` buffer.
+//
+// `skip` columns are already orthonormal — `u_full` extends a finished
+// `U` and must not touch what it extends — and the rest are
+// orthogonalised against them by modified Gram-Schmidt, in the order
+// they stand.
+//
+// **The all-zero column is the case that matters.**  A rank-deficient
+// matrix orthogonalises to a column that is exactly zero, and there is
+// no direction in it to normalise; the answer is an arbitrary but
+// genuinely orthonormal completion, which is the standard basis vector
+// with the most left in it after the earlier columns are removed.  A
+// `U` that normalised a zero column instead would answer a matrix of
+// infinities, and one that left it zero would answer a `U` with a
+// dependent column.
+fn orthonormal_columns(wrk: [Float], m: Int, k: Int, skip: Int) -> [Float]
+    // Everything already placed stays where it is; the columns from
+    // `skip` on are the ones this pass rewrites.
+    var u = wrk[:]
+    var i = 0
+    var j = skip
+    while j < k
+        var col = zeros(m)
+        for i in 0..m
+            col[i] = wrk[i * k + j]
+        // Modified Gram-Schmidt against everything already placed.
+        var p = 0
+        while p < j
+            var d = 0.0
+            for i in 0..m
+                d = d + col[i] * u[i * k + p]
+            for i in 0..m
+                col[i] = col[i] - d * u[i * k + p]
+            p = p + 1
+        var n2 = 0.0
+        for i in 0..m
+            n2 = n2 + col[i] * col[i]
+        if n2 > 0.0
+            let inv = 1.0 / math.sqrt(n2)
+            for i in 0..m
+                u[i * k + j] = col[i] * inv
+        else
+            // The zero column: carry on down the standard basis and
+            // keep the vector with the MOST left in it after the
+            // columns already placed are removed.  Not the first one
+            // with anything left — every standard basis vector that is
+            // not entirely in the span has something left, and taking
+            // the largest remainder is what keeps the completion well
+            // conditioned.
+            var best = zeros(m)
+            var best_en = 0.0
+            for t in 0..m
+                var e = zeros(m)
+                e[t] = 1.0
+                var p2 = 0
+                while p2 < j
+                    var d2 = 0.0
+                    for i in 0..m
+                        d2 = d2 + e[i] * u[i * k + p2]
+                    for i in 0..m
+                        e[i] = e[i] - d2 * u[i * k + p2]
+                    p2 = p2 + 1
+                var en = 0.0
+                for i in 0..m
+                    en = en + e[i] * e[i]
+                if en > best_en
+                    best_en = en
+                    for i in 0..m
+                        best[i] = e[i]
+            if best_en > 0.0
+                let inv2 = 1.0 / math.sqrt(best_en)
+                for i in 0..m
+                    u[i * k + j] = best[i] * inv2
+        j = j + 1
+    u
+
+// The product `U diag(d) Vᵀ`: a flat `rows`-by-`cols` matrix from a
+// thin `U` (`rows x k`), a diagonal `d` of `k` entries, and a thin `V`
+// (`cols x k`).
+//
+// The one shape every product this module answers has — `reconstruct`
+// scales by `s`, `truncate` by a truncated copy of it, `pseudoinverse`
+// by `1/s` with the two sides exchanged, `lstsq` by it against a
+// vector — so the index set is written once rather than four slightly
+// different ways.
+//
+// `uu` and `vv` must be flat `rows`-by-`k` and `cols`-by-`k` buffers,
+// which is what the thin factors are when `k` is the full count; a
+// caller with a smaller `k` slices with `first_columns` first.
+fn diagonal_product(uu: [Float], d: [Float], vv: [Float], rows: Int, cols: Int, k: Int) -> [Float]
+    var out = zeros(rows * cols)
+    var i = 0
+    while i < rows
+        var j = 0
+        while j < cols
+            var s = 0.0
+            for t in 0..k
+                s = s + uu[i * k + t] * d[t] * vv[j * k + t]
+            out[i * cols + j] = s
+            j = j + 1
+        i = i + 1
+    out
+
+// The leading `k` columns of a flat `rows`-by-`cols` matrix, as a flat
+// `rows`-by-`k` one.
+//
+// `truncate` is the caller: it hands `diagonal_product` a `U` and a `V`
+// that have the full column count, and the product has to index them at
+// the stride they are stored with rather than the stride it wants.
+fn first_columns(x: [Float], rows: Int, cols: Int, k: Int) -> [Float]
+    var out = zeros(rows * k)
+    var i = 0
+    while i < rows
+        var j = 0
+        while j < k
+            out[i * k + j] = x[i * cols + j]
+            j = j + 1
+        i = i + 1
+    out
+
+// The first `k` singular values, as a flat list.
+fn first_values(values: [Float], k: Int) -> [Float]
+    var out = zeros(k)
+    for i in 0..k
+        out[i] = values[i]
+    out
+
+// The reciprocals of the singular values above the tolerance, and zero
+// at or below it — the `Σ⁺` of a pseudoinverse.
+fn reciprocal_values(values: [Float], k: Int, tolerance: Float) -> [Float]
+    var out = zeros(k)
+    for i in 0..k
+        if values[i] > tolerance
+            out[i] = 1.0 / values[i]
+    out
 
 // The default sweep limit for the one-sided Jacobi iteration: 30.
 //
@@ -104,43 +464,77 @@ pub struct LaSvd
 // what they have in common is small or zero singular values.  That is
 // the whole reason this decomposition exists.
 pub fn factor(a: NdFloat) -> Result<LaSvd, LaFault> []
-    todo("linalg-nv.lasvd.factor")
+    factor_with_sweeps(a, LASVD_SWEEPS)
 
 // The decomposition with a sweep limit of the caller's choosing.
 pub fn factor_with_sweeps(a: NdFloat, sweeps: Int) -> Result<LaSvd, LaFault> []
-    todo("linalg-nv.lasvd.factor_with_sweeps")
+    let dims = matrix_dims(a, "lasvd.factor_with_sweeps")!
+    let m = list.get(dims, 0)
+    let n = list.get(dims, 1)
+    // One-sided Jacobi orthogonalises COLUMNS, so it wants a matrix
+    // with at least as many rows as columns.  The wide case is the
+    // transpose's decomposition with `U` and `V` exchanged, which is
+    // one line of bookkeeping and no second algorithm.
+    if m >= n
+        let work = jacobi(a, sweeps, true, "lasvd.factor_with_sweeps")!
+        let sorted = sort_descending(work.w, work.v, work.rows, work.cols)
+        let uu = orthonormal_columns(sorted.w, m, n, 0)
+        Ok(LaSvd {
+            u: array_of(uu, [m, n]),
+            s: array_of(sorted.values, [n]),
+            v: array_of(sorted.v, [n, n]),
+            m: m,
+            n: n })
+    else
+        let flipped = ndfloat.transpose(a)
+        let work = jacobi(flipped, sweeps, true, "lasvd.factor_with_sweeps")!
+        let sorted = sort_descending(work.w, work.v, work.rows, work.cols)
+        // `Aᵀ = U' Σ V'ᵀ`, so `A = V' Σ U'ᵀ`: the two sides trade
+        // places, and the thin `V'` is the `m x m` one.
+        let vv = orthonormal_columns(sorted.w, n, m, 0)
+        Ok(LaSvd {
+            u: array_of(sorted.v, [m, m]),
+            s: array_of(sorted.values, [m]),
+            v: array_of(vv, [n, m]),
+            m: m,
+            n: n })
 
 // Only the singular values, without accumulating `U` or `V`.
 //
 // LAPACK's `jobu = 'N', jobv = 'N'`.  What a caller asking about rank,
 // condition or the 2-norm wants, and none of those needs a vector.
 pub fn values_only(a: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasvd.values_only")
+    let dims = matrix_dims(a, "lasvd.values_only")!
+    let m = list.get(dims, 0)
+    let n = list.get(dims, 1)
+    let work = jacobi(a, LASVD_SWEEPS, false, "lasvd.values_only")!
+    let sorted = sort_descending(work.w, work.v, work.rows, work.cols)
+    Ok(array_of(sorted.values, [least(m, n)]))
 
 // How many singular values there are: `min(m, n)`.
 pub fn count(s: LaSvd) -> Int []
-    todo("linalg-nv.lasvd.count")
+    least(s.m, s.n)
 
 // How many rows the factored matrix had.
 pub fn rows(s: LaSvd) -> Int []
-    todo("linalg-nv.lasvd.rows")
+    s.m
 
 // How many columns.
 pub fn cols(s: LaSvd) -> Int []
-    todo("linalg-nv.lasvd.cols")
+    s.n
 
 // The singular values, descending, as a rank-1 array.
 pub fn singular_values(s: LaSvd) -> NdFloat []
-    todo("linalg-nv.lasvd.singular_values")
+    s.s
 
 // `U` in the thin form: `m x k`, orthonormal columns.
 pub fn u(s: LaSvd) -> NdFloat []
-    todo("linalg-nv.lasvd.u")
+    s.u
 
 // `V` in the thin form: `n x k`, orthonormal columns.  NOT `Vᵀ` — see
 // the struct's field comment.
 pub fn v(s: LaSvd) -> NdFloat []
-    todo("linalg-nv.lasvd.v")
+    s.v
 
 // The full `m x m` orthogonal `U`, with the columns beyond the first
 // `k` completing the basis.
@@ -151,7 +545,22 @@ pub fn v(s: LaSvd) -> NdFloat []
 // columns, which for a tall design matrix is most of the memory in the
 // problem.
 pub fn u_full(s: LaSvd) -> NdFloat []
-    todo("linalg-nv.lasvd.u_full")
+    let k = least(s.m, s.n)
+    // The wide case factored the transpose: `k` is `m` already and the
+    // thin `U` is the full one.
+    if k >= s.m
+        s.u
+    else
+        let src = ndfloat.to_list(s.u)
+        var buf = zeros(s.m * s.m)
+        var i = 0
+        while i < s.m
+            var j = 0
+            while j < k
+                buf[i * s.m + j] = src[i * k + j]
+                j = j + 1
+            i = i + 1
+        array_of(orthonormal_columns(buf, s.m, s.m, k), [s.m, s.m])
 
 // The numerical rank: how many singular values exceed the tolerance.
 //
@@ -182,7 +591,14 @@ pub fn u_full(s: LaSvd) -> NdFloat []
 //         Err(e) => println(e.message())
 // ```
 pub fn rank(s: LaSvd, tolerance: Float) -> Result<Int, LaFault> []
-    todo("linalg-nv.lasvd.rank")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let values = ndfloat.to_list(s.s)
+    var r = 0
+    for i in 0..list.len(values)
+        if values[i] > tolerance
+            r = r + 1
+    Ok(r)
 
 // numpy's default rank tolerance for this decomposition:
 // `max(m, n) * eps * s[0]`.
@@ -190,7 +606,13 @@ pub fn rank(s: LaSvd, tolerance: Float) -> Result<Int, LaFault> []
 // Published so that a caller who wants numpy's answer can have it by
 // naming it, rather than by this package choosing it for them.
 pub fn default_rank_tolerance(s: LaSvd) -> Float []
-    todo("linalg-nv.lasvd.default_rank_tolerance")
+    let values = ndfloat.to_list(s.s)
+    var bigger = s.n
+    if s.m > s.n
+        bigger = s.m
+    // `s[0]` is the largest, because the values are descending; a zero
+    // matrix's is zero and its tolerance is zero with it.
+    bigger as Float * LASVD_EPSILON * list.get(values, 0)
 
 // The 2-norm condition number: the largest singular value over the
 // smallest.
@@ -200,7 +622,12 @@ pub fn default_rank_tolerance(s: LaSvd) -> Float []
 // `lanorm.condition_estimate` is the `n²` guess for a caller who only
 // needs an order of magnitude.
 pub fn condition(s: LaSvd) -> Float []
-    todo("linalg-nv.lasvd.condition")
+    let values = ndfloat.to_list(s.s)
+    let top = list.get(values, 0)
+    let bottom = list.get(values, list.len(values) - 1)
+    if bottom == 0.0
+        return math.infinity()
+    top / bottom
 
 // The Moore-Penrose pseudoinverse: `V diag(1/s) Uᵀ`, with singular
 // values at or below the tolerance treated as zero.
@@ -210,7 +637,15 @@ pub fn condition(s: LaSvd) -> Float []
 // singular value of `1e-17` would amplify noise by `1e17`, which is how
 // a pseudoinverse produces a fit made entirely of rounding error.
 pub fn pseudoinverse(s: LaSvd, tolerance: Float) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasvd.pseudoinverse")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let k = least(s.m, s.n)
+    let values = ndfloat.to_list(s.s)
+    let dinv = reciprocal_values(values, k, tolerance)
+    let uu = ndfloat.to_list(s.u)
+    let vv = ndfloat.to_list(s.v)
+    // `V Σ⁺ Uᵀ`, so the two sides exchange roles: `n` by `m`.
+    Ok(array_of(diagonal_product(vv, dinv, uu, s.n, s.m, k), [s.n, s.m]))
 
 // The MINIMUM-NORM least-squares solution of `A x = b`.
 //
@@ -223,7 +658,26 @@ pub fn pseudoinverse(s: LaSvd, tolerance: Float) -> Result<NdFloat, LaFault> []
 // full column rank — faster, and it will tell you if it does not — and
 // this when it might not.  The README says it in a table.
 pub fn lstsq(s: LaSvd, b: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasvd.lstsq")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let rhs = vector_of(b, s.m, "lasvd.lstsq")!
+    let k = least(s.m, s.n)
+    let values = ndfloat.to_list(s.s)
+    let uu = ndfloat.to_list(s.u)
+    let vv = ndfloat.to_list(s.v)
+    // `x = V Σ⁺ Uᵀ b`.  The rotation into the left singular basis is
+    // `Uᵀ b` — a `k`-vector — and the answer is `V` times that scaled.
+    let dinv = reciprocal_values(values, k, tolerance)
+    var x = zeros(s.n)
+    for j in 0..s.n
+        var acc = 0.0
+        for t in 0..k
+            var yt = 0.0
+            for i in 0..s.m
+                yt = yt + uu[i * k + t] * rhs[i]
+            acc = acc + vv[j * k + t] * dinv[t] * yt
+        x[j] = acc
+    Ok(array_of(x, [s.n]))
 
 // The best rank-`k` approximation, by the Eckart-Young theorem: the
 // first `k` singular values and their vectors, the rest dropped.
@@ -236,17 +690,28 @@ pub fn lstsq(s: LaSvd, b: NdFloat, tolerance: Float) -> Result<NdFloat, LaFault>
 //
 // `LaDimensionMismatch` for a `k` outside `1 ..= count`.
 pub fn truncate(s: LaSvd, k: Int) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lasvd.truncate")
+    let total = least(s.m, s.n)
+    if k < 1 or k > total
+        return Err(LaDimensionMismatch(total, k))
+    let values = ndfloat.to_list(s.s)
+    let uu = ndfloat.to_list(s.u)
+    let vv = ndfloat.to_list(s.v)
+    let uk = first_columns(uu, s.m, total, k)
+    let vk = first_columns(vv, s.n, total, k)
+    Ok(array_of(diagonal_product(uk, first_values(values, k), vk, s.m, s.n, k), [s.m, s.n]))
 
 // The 2-norm of the original matrix: its largest singular value.
 //
 // The definition, not an estimate.  `lanorm.norm` with `LaNorm2` is
 // written in terms of this.
 pub fn norm_2(s: LaSvd) -> Float []
-    todo("linalg-nv.lasvd.norm_2")
+    list.get(ndfloat.to_list(s.s), 0)
 
 // The product `U diag(s) Vᵀ` — the original matrix, reconstructed.
 //
 // The round trip every decomposition owes.
 pub fn reconstruct(s: LaSvd) -> NdFloat []
-    todo("linalg-nv.lasvd.reconstruct")
+    let k = least(s.m, s.n)
+    let uu = ndfloat.to_list(s.u)
+    let vv = ndfloat.to_list(s.v)
+    array_of(diagonal_product(uu, ndfloat.to_list(s.s), vv, s.m, s.n, k), [s.m, s.n])

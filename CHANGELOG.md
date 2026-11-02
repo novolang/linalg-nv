@@ -4,6 +4,71 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-10-11
+
+Every body lands.  0.0.3 was the interface; this is the release that
+makes it work, and no signature changed.
+
+- **The five decompositions, implemented as published.**  `lalu.factor`
+  is Gaussian elimination with partial pivoting, and `LaSingular` means
+  a column with no nonzero pivot at all — not a nearly singular one.
+  `laqr.factor` is Householder, with the reflector's sign taken from the
+  far end so `beta` is a sum of magnitudes rather than their difference.
+  `lachol.factor` reads the lower triangle only.  `laeig.factor` and
+  `lasvd.factor` are cyclic and one-sided Jacobi under the published
+  30-sweep bound.  Every function named in the README's LAPACK table is
+  the routine that table names.
+- **The refusals are the published ones, to the sentence.**  Each shape
+  check names the entry point that looked, `LaSingular` carries the
+  column and the pivot, `LaNotPositiveDefinite` carries the position and
+  the value, and `LaNoConvergence` carries the sweep count and the
+  residual.
+- **A second suite, `tests/linalg_edge_tests.nv`, 23 tests.**  The
+  oracle's 26 tests are unchanged.  The supplement holds what a success
+  path cannot pin: every `LaFault` variant's message, an exactly
+  singular matrix (a repeated row) and one an ulp from singular, a
+  degenerate spectrum whose zero eigenvalue makes the condition number
+  an infinity, the shapes each entry point refuses, a factor assembled
+  by hand with a zero on `U`'s diagonal, and the reconstruction undoing
+  a pivot that partial pivoting actually made.
+- **`lanorm.array_of` deleted.**  A private helper with no caller, and
+  the one instrumented line neither suite could reach.
+- **Coverage is complete**: 1569 of 1569 instrumented lines under `src/`
+  are covered by the two suites, so the release carries no `cov: skip`
+  marker.
+
+### Changed
+
+- `novo.toml`: `version` 0.1.0, `stability = "experimental"`, the
+  `novo` floor to `>= 0.20.2` (the compiler this was verified against),
+  and the `description` without its interface-only tail.
+- `README.md`: the `NOT IMPLEMENTED` block and the implementation-status
+  table are gone, with nothing in their place; the sentences that said
+  the tests fail at run are gone; the Tests section names both suites.
+- Each `src/*.nv` header drops the "every body is a `todo()`" sentence.
+  The design prose is unchanged.
+- `tests/linalg_tests.nv`: the release-stamp sentence in the header is
+  gone.  No assertion changed.
+- `lanorm.nv`: `array_of` removed (see above); nothing called it.
+
+### Known
+
+- **The one-call forms delegate their shape checks.**  A refusal from
+  `lasolve.solve` still names `lalu.factor` or `lalu.solve`, not the
+  entry point the caller wrote, because the one-shot form is the two
+  lines it is documented to be.  The edge suite pins the wording.
+- **`lanorm.condition_estimate` is a lower bound and can undershoot.**
+  Hager's iteration stops at the first column that fails to beat the
+  best already seen, which is what makes the estimate honest rather
+  than an overshoot.  On `[[-3,-1,0],[2,1,-1],[0,1,0]]` it answers 5
+  where the true 1-norm condition number is 25/3 ≈ 8.33.  Pinned in the
+  edge suite; the doc block says why.
+- **One design pin was unpinned until this release's edge suite.**  A
+  mutation that stops `lalu.reconstruct` undoing the permutation
+  survived both suites before `test_the_reconstruction_undoes_the_pivots_the_factorisation_made`
+  was added; the oracle checks the reconstruction against the identity
+  only, which swaps nothing.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A

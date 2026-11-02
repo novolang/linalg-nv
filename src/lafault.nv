@@ -1,8 +1,5 @@
 // lafault — every way a decomposition or a solve can refuse.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // THREE KINDS OF REFUSAL, AND TELLING THEM APART IS THE POINT.
 //
 //   A SHAPE refusal — a non-square matrix where a square one is
@@ -97,7 +94,29 @@ impl Error for LaFault
     //     // linalg: a 3 by 4 matrix is not square
     // ```
     fn message(self) -> Str
-        todo("linalg-nv.lafault.LaFault.message")
+        match self
+            LaNotMatrix(what, rank)           =>
+                "linalg: ${what} wants a matrix and got an array of rank ${rank}"
+            LaNotVector(what, rank)           =>
+                "linalg: ${what} wants a vector and got an array of rank ${rank}"
+            LaNotSquare(rows, cols)           =>
+                "linalg: a ${rows} by ${cols} matrix is not square"
+            LaDimensionMismatch(want, got)    =>
+                "linalg: the operand has ${got} where ${want} was wanted"
+            LaEmptyMatrix(rows, cols)         =>
+                "linalg: a ${rows} by ${cols} matrix has no factorisation"
+            LaUnderdetermined(rows, cols)     =>
+                "linalg: a ${rows} by ${cols} matrix has more columns than rows"
+            LaSingular(at, pivot)             =>
+                "linalg: singular at column ${at}, pivot ${pivot}"
+            LaNotPositiveDefinite(at, value)  =>
+                "linalg: not positive definite at position ${at}, value ${value}"
+            LaNoConvergence(sweeps, residual) =>
+                "linalg: no convergence in ${sweeps} sweep(s), residual ${residual}"
+            LaBadTolerance(tolerance)         =>
+                "linalg: a tolerance of ${tolerance} is negative"
+            LaBadNormOrder(p)                 =>
+                "linalg: a norm order of ${p} is below 1"
 
 // Whether this refusal is about SHAPE — the calling code is wrong.
 //
@@ -110,7 +129,18 @@ impl Error for LaFault
 //     println("${a} ${b}")   // true false
 // ```
 pub fn is_shape_fault(e: LaFault) -> Bool []
-    todo("linalg-nv.lafault.is_shape_fault")
+    match e
+        LaNotMatrix(_, _)           => true
+        LaNotVector(_, _)           => true
+        LaNotSquare(_, _)           => true
+        LaDimensionMismatch(_, _)   => true
+        LaEmptyMatrix(_, _)         => true
+        LaUnderdetermined(_, _)     => true
+        LaSingular(_, _)            => false
+        LaNotPositiveDefinite(_, _) => false
+        LaNoConvergence(_, _)       => false
+        LaBadTolerance(_)           => false
+        LaBadNormOrder(_)           => false
 
 // Whether this refusal is about the MATRIX — the data says no, and a
 // fallback is what the caller wants.
@@ -119,9 +149,31 @@ pub fn is_shape_fault(e: LaFault) -> Bool []
 // first wants `lasolve.lstsq` instead of `lasolve.solve`; one that met
 // the second wants LU instead of Cholesky.
 pub fn is_singular_fault(e: LaFault) -> Bool []
-    todo("linalg-nv.lafault.is_singular_fault")
+    match e
+        LaNotMatrix(_, _)           => false
+        LaNotVector(_, _)           => false
+        LaNotSquare(_, _)           => false
+        LaDimensionMismatch(_, _)   => false
+        LaEmptyMatrix(_, _)         => false
+        LaUnderdetermined(_, _)     => false
+        LaSingular(_, _)            => true
+        LaNotPositiveDefinite(_, _) => true
+        LaNoConvergence(_, _)       => false
+        LaBadTolerance(_)           => false
+        LaBadNormOrder(_)           => false
 
 // Whether this refusal is a sweep limit — raising the bound and
 // retrying is a reasonable thing to do.
 pub fn is_convergence_fault(e: LaFault) -> Bool []
-    todo("linalg-nv.lafault.is_convergence_fault")
+    match e
+        LaNotMatrix(_, _)           => false
+        LaNotVector(_, _)           => false
+        LaNotSquare(_, _)           => false
+        LaDimensionMismatch(_, _)   => false
+        LaEmptyMatrix(_, _)         => false
+        LaUnderdetermined(_, _)     => false
+        LaSingular(_, _)            => false
+        LaNotPositiveDefinite(_, _) => false
+        LaNoConvergence(_, _)       => true
+        LaBadTolerance(_)           => false
+        LaBadNormOrder(_)           => false

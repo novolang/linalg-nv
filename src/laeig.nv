@@ -1,8 +1,5 @@
 // laeig — the symmetric eigendecomposition, by cyclic Jacobi.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // SYMMETRIC ONLY, AND THAT IS A DESIGN DECISION RATHER THAN A GAP.  The
 // general eigenproblem has complex eigenvalues even for a real matrix,
 // so its API needs a complex type, complex eigenvectors, a left and a
@@ -50,6 +47,249 @@
 // implementation.  `README` names it under the conventions.
 
 use ndfloat
+use lafault
+
+// ── the shapes, the buffers, and one rotation ───────────────────────
+//
+// Each module in this package carries its own copy of these few-line
+// helpers, the way `stats-nv`'s modules each carry an `array_of`: a
+// module's private functions are its own business, and the rotation is
+// the one thing in this module only this module knows how to apply.
+
+// The working precision, give or take: the gap between 1.0 and the
+// next double.  A private constant because the standard library
+// publishes no such thing and the convergence threshold is a number
+// this module has to own.
+const LAEIG_EPSILON = 2.220446049250313e-16
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.  A zero dimension is refused here rather than later:
+// every decomposition of an empty matrix is defensible and none of
+// them is useful.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows == 0 or cols == 0
+        return Err(LaEmptyMatrix(rows, cols))
+    Ok(dims[:])
+
+// The extents of a square matrix, or the refusal that says why it is
+// not one.
+fn square_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = matrix_dims(a, what)!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    Ok(dims)
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// A flat row-major `n`-by-`n` identity.
+fn identity(n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        out[i * n + i] = 1.0
+        i = i + 1
+    out
+
+// An array over a flat list at these dims.  Every caller here builds
+// the list to the length the dims describe, so the array underneath
+// had nothing to refuse.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The Frobenius norm of a flat row-major `n`-by-`n` matrix.
+fn frobenius(m: [Float], n: Int) -> Float
+    var s = 0.0
+    for i in 0..n * n
+        s = s + m[i] * m[i]
+    math.sqrt(s)
+
+// The norm of the strict upper triangle — the number a Jacobi sweep
+// drives to zero, and the number `LaNoConvergence` reports.
+//
+// One triangle, because the matrix is symmetric and the other one
+// carries the same numbers: a caller watching this fall wants the
+// measure of how far the matrix still is from diagonal, not a factor
+// of `sqrt 2`.
+fn off_norm(m: [Float], n: Int) -> Float
+    var s = 0.0
+    var i = 0
+    while i < n
+        var j = i + 1
+        while j < n
+            s = s + m[i * n + j] * m[i * n + j]
+            j = j + 1
+        i = i + 1
+    math.sqrt(s)
+
+// One Jacobi rotation: the plane rotation in the `(p, q)` plane that
+// annihilates `m[p][q]`, applied to the matrix and — when the vectors
+// are being accumulated — to the vector matrix.
+//
+// The rotation is chosen by the classical form, and the choice matters:
+// `t` is the SMALLER root of `t² + 2τt - 1 = 0`, taken through
+// `sign(τ)/(|τ| + sqrt(τ²+1))` so that no step is a difference of two
+// nearly equal magnitudes.  The larger root is an almost-half-turn
+// rotation that is still correct and loses the accuracy this whole
+// module is here for.
+fn rotate(var m: [Float], n: Int, p: Int, q: Int, var v: [Float], keep: Bool)
+    let apq = m[p * n + q]
+    let app = m[p * n + p]
+    let aqq = m[q * n + q]
+    let tau = (aqq - app) / (2.0 * apq)
+    var t = 1.0
+    if tau != 0.0
+        t = math.abs(tau) + math.sqrt(tau * tau + 1.0)
+        if tau < 0.0
+            t = 0.0 - t
+        t = 1.0 / t
+    let c = 1.0 / math.sqrt(1.0 + t * t)
+    let s = t * c
+    // The rows and columns off the `(p, q)` plane.
+    var i = 0
+    while i < n
+        if i != p and i != q
+            let aip = m[i * n + p]
+            let aiq = m[i * n + q]
+            m[i * n + p] = c * aip - s * aiq
+            m[p * n + i] = c * aip - s * aiq
+            m[i * n + q] = s * aip + c * aiq
+            m[q * n + i] = s * aip + c * aiq
+        i = i + 1
+    m[p * n + p] = c * c * app - 2.0 * s * c * apq + s * s * aqq
+    m[q * n + q] = s * s * app + 2.0 * s * c * apq + c * c * aqq
+    m[p * n + q] = 0.0
+    m[q * n + p] = 0.0
+    if keep
+        i = 0
+        while i < n
+            let vip = v[i * n + p]
+            let viq = v[i * n + q]
+            v[i * n + p] = c * vip - s * viq
+            v[i * n + q] = s * vip + c * viq
+            i = i + 1
+
+// What one Jacobi run produces: the eigenvalues in whatever order the
+// diagonal finished in, and the eigenvector matrix.
+//
+// Private, because the interface publishes `LaEigen` and this is the
+// state between the arithmetic and that value.
+struct LaSpectral
+    values: [Float]
+    vectors: [Float]
+    n: Int
+
+// The cyclic Jacobi iteration itself, for the symmetric decomposition
+// and for the two entry points that want different amounts of it.
+//
+// `keep` accumulates the eigenvectors; `values_only` runs with it
+// false and skips a column update per rotation, which is where the
+// third of the work the doc mentions goes.
+fn jacobi(a: NdFloat, sweeps: Int, keep: Bool, what: Str) -> Result<LaSpectral, LaFault>
+    let dims = square_dims(a, what)!
+    let n = list.get(dims, 0)
+    let src = ndfloat.to_list(a)
+    // Symmetrise from the lower triangle, which is the only triangle
+    // read — the reason `lachol` gives is this one.
+    var m = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = 0
+        while j < n
+            if i >= j
+                m[i * n + j] = src[i * n + j]
+            else
+                m[i * n + j] = src[j * n + i]
+            j = j + 1
+        i = i + 1
+    var v = identity(n)
+    let scale = frobenius(m, n)
+    let floor = LAEIG_EPSILON * n as Float * scale
+    var off = off_norm(m, n)
+    var sweep = 0
+    while sweep < sweeps and off > floor
+        // One sweep: every off-diagonal pair once, which is the
+        // "cyclic" in cyclic Jacobi.
+        var p = 0
+        while p < n - 1
+            var q = p + 1
+            while q < n
+                if m[p * n + q] != 0.0
+                    rotate(var m, n, p, q, var v, keep)
+                q = q + 1
+            p = p + 1
+        off = off_norm(m, n)
+        sweep = sweep + 1
+    if off > floor
+        Err(LaNoConvergence(sweeps, off))
+    else
+        var w = zeros(n)
+        for i in 0..n
+            w[i] = m[i * n + i]
+        Ok(LaSpectral { values: w, vectors: v, n: n })
+
+// The eigenvalues sorted descending, with the eigenvector columns
+// carried along.
+//
+// A selection sort, because `n` is small, the comparison is on a
+// number, and a sort that could disagree with the swap of the columns
+// would be a wrong answer of exactly the kind the sort order is
+// published to prevent.
+fn sort_descending(w: [Float], v: [Float], n: Int) -> LaSpectral
+    var values = w[:]
+    var vectors = v[:]
+    for i in 0..n - 1
+        var best = i
+        for j in i + 1..n
+            if values[j] > values[best]
+                best = j
+        if best != i
+            let tv = values[i]
+            values[i] = values[best]
+            values[best] = tv
+            var r = 0
+            while r < n
+                let tc = vectors[r * n + i]
+                vectors[r * n + i] = vectors[r * n + best]
+                vectors[r * n + best] = tc
+                r = r + 1
+    LaSpectral { values: values, vectors: vectors, n: n }
+
+// `V diag(w^p) Vᵀ`, the one matrix function the three callers of it
+// share: `power`, `reconstruct`, and nothing else.
+fn spectral_product(e: LaEigen, powers: [Float]) -> NdFloat
+    let n = e.n
+    let v = ndfloat.to_list(e.vectors)
+    // Scale the columns of `V` by the powers — `V diag(w^p)`.
+    var scaled = zeros(n * n)
+    var i = 0
+    while i < n
+        for j in 0..n
+            scaled[i * n + j] = v[i * n + j] * list.get(powers, j)
+        i = i + 1
+    // And multiply by `Vᵀ`: `D[j][i] = V[i][j]`.
+    var out = zeros(n * n)
+    i = 0
+    while i < n
+        var j2 = 0
+        while j2 < n
+            var s = 0.0
+            var k = 0
+            while k < n
+                s = s + scaled[i * n + k] * v[j2 * n + k]
+                k = k + 1
+            out[i * n + j2] = s
+            j2 = j2 + 1
+        i = i + 1
+    array_of(out, [n, n])
 
 // The default sweep limit for the Jacobi iteration: 30.
 //
@@ -98,7 +338,7 @@ pub struct LaEigen
 // `lachol` gives.  `LaNotMatrix`, `LaNotSquare`, `LaEmptyMatrix`, and
 // `LaNoConvergence` with the limit and the off-diagonal norm reached.
 pub fn factor(a: NdFloat) -> Result<LaEigen, LaFault> []
-    todo("linalg-nv.laeig.factor")
+    factor_with_sweeps(a, LAEIG_SWEEPS)
 
 // The symmetric eigendecomposition with a sweep limit of the caller's
 // choosing.
@@ -109,7 +349,12 @@ pub fn factor(a: NdFloat) -> Result<LaEigen, LaFault> []
 // zero sweeps is a legitimate thing to ask for and a legitimate thing
 // to fail at.
 pub fn factor_with_sweeps(a: NdFloat, sweeps: Int) -> Result<LaEigen, LaFault> []
-    todo("linalg-nv.laeig.factor_with_sweeps")
+    let sp = jacobi(a, sweeps, true, "laeig.factor_with_sweeps")!
+    let sorted = sort_descending(sp.values, sp.vectors, sp.n)
+    Ok(LaEigen {
+        values: array_of(sorted.values, [sp.n]),
+        vectors: array_of(sorted.vectors, [sp.n, sp.n]),
+        n: sp.n })
 
 // Only the eigenvalues, without accumulating the eigenvectors.
 //
@@ -117,26 +362,35 @@ pub fn factor_with_sweeps(a: NdFloat, sweeps: Int) -> Result<LaEigen, LaFault> [
 // caller asking about definiteness, condition or a spectrum's shape
 // wants — none of which needs a vector.
 pub fn values_only(a: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laeig.values_only")
+    let sp = jacobi(a, LAEIG_SWEEPS, false, "laeig.values_only")!
+    let sorted = sort_descending(sp.values, sp.vectors, sp.n)
+    Ok(array_of(sorted.values, [sp.n]))
 
 // How many rows the factored matrix had.
 pub fn order(e: LaEigen) -> Int []
-    todo("linalg-nv.laeig.order")
+    e.n
 
 // The eigenvalues, descending, as a rank-1 array of length `n`.
 pub fn values(e: LaEigen) -> NdFloat []
-    todo("linalg-nv.laeig.values")
+    e.values
 
 // The eigenvectors as the columns of an `n x n` orthogonal matrix.
 pub fn vectors(e: LaEigen) -> NdFloat []
-    todo("linalg-nv.laeig.vectors")
+    e.vectors
 
 // The `k`th eigenvector, as a rank-1 array of length `n`.
 //
 // The accessor that removes the rows-or-columns question from every
 // call site.  `LaDimensionMismatch` for a `k` outside `0 ..= n - 1`.
 pub fn vector(e: LaEigen, k: Int) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laeig.vector")
+    let n = e.n
+    if k < 0 or k >= n
+        return Err(LaDimensionMismatch(n, k))
+    let v = ndfloat.to_list(e.vectors)
+    var out = zeros(n)
+    for i in 0..n
+        out[i] = v[i * n + k]
+    Ok(array_of(out, [n]))
 
 // The largest eigenvalue by absolute value, which is the matrix's
 // spectral radius.
@@ -147,7 +401,14 @@ pub fn vector(e: LaEigen, k: Int) -> Result<NdFloat, LaFault> []
 // exactly the one that makes a power-iteration convergence argument
 // right or wrong, so both are reachable and this one is named.
 pub fn spectral_radius(e: LaEigen) -> Float []
-    todo("linalg-nv.laeig.spectral_radius")
+    let n = e.n
+    let w = ndfloat.to_list(e.values)
+    var r = 0.0
+    for i in 0..n
+        let a = math.abs(w[i])
+        if a > r
+            r = a
+    r
 
 // The 2-norm condition number: the largest absolute eigenvalue over the
 // smallest.
@@ -157,7 +418,19 @@ pub fn spectral_radius(e: LaEigen) -> Float []
 // already decomposed should not pay for an SVD to learn something the
 // decomposition already knows.  `inf` when the smallest is zero.
 pub fn condition(e: LaEigen) -> Float []
-    todo("linalg-nv.laeig.condition")
+    let n = e.n
+    let w = ndfloat.to_list(e.values)
+    var lo = math.infinity()
+    var hi = 0.0
+    for i in 0..n
+        let a = math.abs(w[i])
+        if a > hi
+            hi = a
+        if a < lo
+            lo = a
+    if lo == 0.0
+        return math.infinity()
+    hi / lo
 
 // How many eigenvalues are positive, zero and negative, as a triple —
 // the quadratic form's inertia.
@@ -168,7 +441,21 @@ pub fn condition(e: LaEigen) -> Float []
 // `tolerance` is how close to zero counts as zero; `LaBadTolerance` for
 // a negative one.
 pub fn inertia(e: LaEigen, tolerance: Float) -> Result<LaInertia, LaFault> []
-    todo("linalg-nv.laeig.inertia")
+    if tolerance < 0.0
+        return Err(LaBadTolerance(tolerance))
+    let n = e.n
+    let w = ndfloat.to_list(e.values)
+    var positive = 0
+    var zero = 0
+    var negative = 0
+    for i in 0..n
+        if w[i] > tolerance
+            positive = positive + 1
+        elif w[i] < 0.0 - tolerance
+            negative = negative + 1
+        else
+            zero = zero + 1
+    Ok(LaInertia { positive: positive, zero: zero, negative: negative })
 
 // LaInertia is the count of eigenvalues on each side of zero.
 //
@@ -195,11 +482,28 @@ pub struct LaInertia
 // real — and answering a NaN there would be a silent wrong answer
 // rather than a refusal.
 pub fn power(e: LaEigen, p: Float) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laeig.power")
+    let n = e.n
+    let w = ndfloat.to_list(e.values)
+    let whole = p == math.floor(p)
+    var powers = zeros(n)
+    var i = 0
+    while i < n
+        let wv = w[i]
+        // A negative eigenvalue to a fractional power is not real, and
+        // zero to a negative one is not finite: both are refusals
+        // rather than a NaN that travels.
+        if wv < 0.0 and not whole
+            return Err(LaNotPositiveDefinite(i, wv))
+        if wv == 0.0 and p < 0.0
+            return Err(LaNotPositiveDefinite(i, wv))
+        powers[i] = math.pow(wv, p)
+        i = i + 1
+    Ok(spectral_product(e, powers))
 
 // The product `V diag(w) Vᵀ` — the original matrix, reconstructed.
 //
 // The round trip every decomposition owes, and for an orthogonal `V` it
 // is also the check that `V` really is orthogonal.
 pub fn reconstruct(e: LaEigen) -> NdFloat []
-    todo("linalg-nv.laeig.reconstruct")
+    let w = ndfloat.to_list(e.values)
+    spectral_product(e, w)

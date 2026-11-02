@@ -10,12 +10,6 @@ reference is [OpenBLAS](https://www.openblas.net/), which implements the
 [BLAS](https://www.netlib.org/blas/) interfaces, and every function here
 names the LAPACK routine it mirrors.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a factorisation is, and which five are here
 
 A **factorisation**, or decomposition, writes a matrix as a product of
@@ -89,10 +83,7 @@ fn main() [io]
                                         Ok(n)  => println("the solution has length ${n}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: linalg-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -268,6 +259,7 @@ faster path can be substituted later without changing a caller.
 
 ```bash
 novo test tests/linalg_tests.nv       # 26 tests: the identities and the hand factorisations
+novo test tests/linalg_edge_tests.nv  # 23 tests: the refusals, the degenerate cases, the branches
 ```
 
 A factorisation of an arbitrary matrix is not unique. The signs of `Q`'s
@@ -298,33 +290,11 @@ factorisation is asserted to within 1e-10. A backward-stable
 decomposition of a matrix of these sizes has an error near 1e-14, and a
 wrong implementation is wrong by a whole unit rather than by 1e-9.
 
-The tests compile today and fail at run, each on the
-`not implemented: linalg-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `laeig.LAEIG_SWEEPS`, `lasvd.LASVD_SWEEPS` | yes (they are constants) |
-| `lalu.LaLu`, `.LaLogDet`, `laqr.LaQr`, `lachol.LaChol` | declared |
-| `laeig.LaEigen`, `.LaInertia`, `lasvd.LaSvd`, `lanorm.LaNorm`, `lafault.LaFault` | declared |
-| `lalu.factor`, `.order`, `.lower`, `.upper`, `.permutation`, `.permutation_indices`, `.reconstruct` | no |
-| `lalu.solve`, `.solve_matrix`, `.determinant`, `.log_abs_determinant`, `.inverse` | no |
-| `laqr.factor`, `.rows`, `.cols`, `.q`, `.q_thin`, `.r`, `.reconstruct` | no |
-| `laqr.apply_q`, `.apply_q_transpose`, `.lstsq`, `.residual_norm`, `.solve_r` | no |
-| `lachol.factor`, `.is_positive_definite`, `.order`, `.lower`, `.upper`, `.reconstruct` | no |
-| `lachol.solve`, `.solve_matrix`, `.inverse`, `.determinant`, `.log_determinant`, `.apply_lower` | no |
-| `laeig.factor`, `.factor_with_sweeps`, `.values_only`, `.order`, `.values`, `.vectors`, `.vector`, `.reconstruct` | no |
-| `laeig.spectral_radius`, `.condition`, `.inertia`, `.power` | no |
-| `lasvd.factor`, `.factor_with_sweeps`, `.values_only`, `.count`, `.rows`, `.cols`, `.reconstruct` | no |
-| `lasvd.singular_values`, `.u`, `.v`, `.u_full` | no |
-| `lasvd.rank`, `.default_rank_tolerance`, `.condition`, `.pseudoinverse`, `.lstsq`, `.truncate`, `.norm_2` | no |
-| `lanorm.norm`, `.vector_norm`, `.vector_norm_p`, `.vector_norm_inf`, `.dot`, `.trace` | no |
-| `lanorm.condition`, `.condition_estimate`, `.symmetry_defect`, `.orthogonality_defect` | no |
-| `lasolve`'s ten one-call forms | no |
-| `lafault`'s eleven variants, its three predicates and its `Error` implementation | no |
+A supplementary edge suite holds the other half of what a success path
+cannot pin: every refusal with the fault's own sentence, an exactly
+singular matrix and one singular to within an ulp, the degenerate
+spectra, the shapes each entry point refuses, and the reconstruction
+undoing the pivots a partial pivot actually made.
 
 ## Licence
 

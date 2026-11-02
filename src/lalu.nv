@@ -1,9 +1,6 @@
 // lalu — the LU factorisation with partial pivoting, which is the one
 // every other function in this package falls back to.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT IT IS.  `P A = L U`: a permutation, a unit-lower-triangular
 // factor and an upper-triangular one.  Gaussian elimination with the
 // largest remaining entry in each column chosen as the pivot, which is
@@ -41,6 +38,127 @@
 // directly.
 
 use ndfloat
+use lafault
+
+// ── the shapes, and the buffers the arithmetic runs on ──────────────
+//
+// Every module in this package carries its own copy of these: a
+// package's private helpers are not reachable across a module
+// boundary, and the published surface is the interface's.
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.  A zero dimension is refused here rather than later:
+// every decomposition of an empty matrix is defensible and none of
+// them is useful.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows == 0 or cols == 0
+        return Err(LaEmptyMatrix(rows, cols))
+    Ok(dims[:])
+
+// The extents of a square matrix, or the refusal that says why it is
+// not one.
+fn square_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = matrix_dims(a, what)!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    Ok(dims)
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// A flat row-major `n`-by-`n` identity.
+fn identity(n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        out[i * n + i] = 1.0
+        i = i + 1
+    out
+
+// An array over a flat list at these dims.  Every caller here builds
+// the list to the length the dims describe, so the array underneath
+// had nothing to refuse.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The product of two flat row-major `n`-by-`n` matrices.
+fn mul_square(x: [Float], y: [Float], n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = 0
+        while j < n
+            var s = 0.0
+            var k = 0
+            while k < n
+                s = s + x[i * n + k] * y[k * n + j]
+                k = k + 1
+            out[i * n + j] = s
+            j = j + 1
+        i = i + 1
+    out
+
+// ── the solve the factors are for ───────────────────────────────────
+
+// `A x = b` from the factors, for one right-hand side given flat.
+//
+// `P b` first, then forward substitution through the unit-lower `L`
+// (whose multipliers are read straight out of the packed array), then
+// back substitution through `U`.
+fn solve_one(lu: LaLu, b: [Float]) -> [Float]
+    let n = order(lu)
+    let perm = permutation_indices(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var y = zeros(n)
+    for i in 0..n
+        y[i] = b[list.get(perm, i)]
+    for i in 0..n
+        var s = y[i]
+        for j in 0..i
+            s = s - packed[i * n + j] * y[j]
+        y[i] = s
+    var i = n - 1
+    while i >= 0
+        var s = y[i]
+        for j in i + 1..n
+            s = s - packed[i * n + j] * y[j]
+        y[i] = s / packed[i * n + i]
+        i = i - 1
+    y
+
+// ── the shape of a right-hand side ──────────────────────────────────
+
+// The length of a vector operand, or the refusal that says why it is
+// not one of the length the factors need.
+fn vector_of(b: NdFloat, n: Int, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(b)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    let xs = ndfloat.to_list(b)
+    if list.len(xs) != n
+        return Err(LaDimensionMismatch(n, list.len(xs)))
+    Ok(xs)
+
+// The column count of a matrix operand that has `n` rows, or the
+// refusal that says why it is not the shape the factors need.
+fn columns_of(b: NdFloat, n: Int, what: Str) -> Result<Int, LaFault>
+    let r = ndfloat.rank(b)
+    if r != 2
+        return Err(LaNotMatrix(what, r))
+    let dims = ndfloat.shape(b).dims
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != n
+        return Err(LaDimensionMismatch(n, rows))
+    Ok(cols)
 
 // LaLu is the LU factorisation of a square matrix, with its pivots.
 //
@@ -89,11 +207,58 @@ pub struct LaLu
 // for. `LaSingular` here means exactly zero to within the working
 // precision, not "nearly singular".
 pub fn factor(a: NdFloat) -> Result<LaLu, LaFault> []
-    todo("linalg-nv.lalu.factor")
+    let dims = square_dims(a, "lalu.factor")!
+    let n = list.get(dims, 0)
+    var m = ndfloat.to_list(a)
+    var pivots: [Int] = []
+    var swaps = 0
+    var k = 0
+    while k < n
+        // Partial pivoting: the largest remaining entry of this column
+        // becomes the pivot, so the multipliers below it stay at or
+        // under one.  Without this the swap matrix divides by zero on
+        // its very first step.
+        var best = k
+        var bestv = math.abs(m[k * n + k])
+        var i = k + 1
+        while i < n
+            let v = math.abs(m[i * n + k])
+            if v > bestv
+                best = i
+                bestv = v
+            i = i + 1
+        // A column that is entirely zero below the diagonal has no
+        // pivot at all.  That — and not "nearly singular" — is what
+        // `LaSingular` means here.
+        if bestv == 0.0
+            return Err(LaSingular(k, 0.0))
+        if best != k
+            var j = 0
+            while j < n
+                let tmp = m[k * n + j]
+                m[k * n + j] = m[best * n + j]
+                m[best * n + j] = tmp
+                j = j + 1
+            swaps = swaps + 1
+        pivots = list.push(pivots, best)
+        // Eliminate below the diagonal, keeping the multiplier in `L`'s
+        // place of the packed array.
+        let pivot = m[k * n + k]
+        var r = k + 1
+        while r < n
+            let f = m[r * n + k] / pivot
+            m[r * n + k] = f
+            var j = k + 1
+            while j < n
+                m[r * n + j] = m[r * n + j] - f * m[k * n + j]
+                j = j + 1
+            r = r + 1
+        k = k + 1
+    Ok(LaLu { packed: array_of(m, dims), pivots: pivots, swaps: swaps })
 
 // How many rows the factored matrix had.
 pub fn order(lu: LaLu) -> Int []
-    todo("linalg-nv.lalu.order")
+    list.len(lu.pivots)
 
 // The unit-lower-triangular factor `L`, unpacked into its own `n x n`
 // matrix with ones on the diagonal.
@@ -101,11 +266,34 @@ pub fn order(lu: LaLu) -> Int []
 // A copy.  See the module comment: the packed form is the storage and
 // this is the API.
 pub fn lower(lu: LaLu) -> NdFloat []
-    todo("linalg-nv.lalu.lower")
+    let n = order(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = 0
+        while j < n
+            if i > j
+                out[i * n + j] = packed[i * n + j]
+            elif i == j
+                out[i * n + j] = 1.0
+            j = j + 1
+        i = i + 1
+    array_of(out, [n, n])
 
 // The upper-triangular factor `U`, unpacked.
 pub fn upper(lu: LaLu) -> NdFloat []
-    todo("linalg-nv.lalu.upper")
+    let n = order(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = i
+        while j < n
+            out[i * n + j] = packed[i * n + j]
+            j = j + 1
+        i = i + 1
+    array_of(out, [n, n])
 
 // The permutation `P` as an `n x n` matrix of zeros and ones, so that
 // `P A = L U` can be checked directly.
@@ -115,14 +303,29 @@ pub fn upper(lu: LaLu) -> NdFloat []
 // the suite multiplies the three factors and compares against the
 // original.
 pub fn permutation(lu: LaLu) -> NdFloat []
-    todo("linalg-nv.lalu.permutation")
+    let n = order(lu)
+    let perm = permutation_indices(lu)
+    var out = zeros(n * n)
+    for i in 0..n
+        out[i * n + list.get(perm, i)] = 1.0
+    array_of(out, [n, n])
 
 // The permutation as the index list `perm[i] = j`, meaning row `j` of
 // the original is row `i` of `P A`.
 //
 // What a caller applies to a right-hand side without building a matrix.
 pub fn permutation_indices(lu: LaLu) -> [Int] []
-    todo("linalg-nv.lalu.permutation_indices")
+    let n = order(lu)
+    var perm = list.map(0..n, i => i)
+    for i in 0..n
+        // The recorded swap is between row `i` and row `pivots[i]`, in
+        // the order the exchanges were applied — LAPACK's `ipiv`.
+        let other = list.get(lu.pivots, i)
+        let here = list.get(perm, i)
+        let there = list.get(perm, other)
+        perm[i] = there
+        perm[other] = here
+    perm
 
 // `x` such that `A x = b`, for a vector `b`.
 //
@@ -153,7 +356,9 @@ pub fn permutation_indices(lu: LaLu) -> [Int] []
 //         Err(e) => println(e.message())
 // ```
 pub fn solve(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lalu.solve")
+    let n = order(lu)
+    let rhs = vector_of(b, n, "lalu.solve")!
+    Ok(array_of(solve_one(lu, rhs), [n]))
 
 // `X` such that `A X = B`, for a matrix `B` of several right-hand
 // sides at once.
@@ -163,7 +368,20 @@ pub fn solve(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
 // factors, one allocation, and the inner loops run over columns rather
 // than over calls.
 pub fn solve_matrix(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lalu.solve_matrix")
+    let n = order(lu)
+    let cols = columns_of(b, n, "lalu.solve_matrix")!
+    let flat = ndfloat.to_list(b)
+    var out = zeros(n * cols)
+    var c = 0
+    while c < cols
+        var col = zeros(n)
+        for i in 0..n
+            col[i] = flat[i * cols + c]
+        let x = solve_one(lu, col)
+        for i in 0..n
+            out[i * cols + c] = x[i]
+        c = c + 1
+    Ok(array_of(out, [n, cols]))
 
 // The determinant of the factored matrix: the product of `U`'s
 // diagonal, with the sign of the permutation.
@@ -178,7 +396,16 @@ pub fn solve_matrix(lu: LaLu, b: NdFloat) -> Result<NdFloat, LaFault> []
 // 10^100, and the product runs through every intermediate on the way.
 // `log_abs_determinant` is the call for anything large.
 pub fn determinant(lu: LaLu) -> Float []
-    todo("linalg-nv.lalu.determinant")
+    let n = order(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var d = 1.0
+    var i = 0
+    while i < n
+        d = d * packed[i * n + i]
+        i = i + 1
+    if lu.swaps % 2 == 1
+        d = 0.0 - d
+    d
 
 // The natural logarithm of the absolute determinant, and its sign, as a
 // pair.
@@ -190,7 +417,24 @@ pub fn determinant(lu: LaLu) -> Float []
 //
 // `sign` is +1, -1 or 0, and `log_abs` is `-inf` when the sign is 0.
 pub fn log_abs_determinant(lu: LaLu) -> LaLogDet []
-    todo("linalg-nv.lalu.log_abs_determinant")
+    let n = order(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var log_abs = 0.0
+    var any_zero = false
+    var i = 0
+    while i < n
+        let d = packed[i * n + i]
+        if d == 0.0
+            any_zero = true
+        else
+            log_abs = log_abs + math.log(math.abs(d))
+        i = i + 1
+    if any_zero
+        return LaLogDet { sign: 0.0, log_abs: 0.0 - math.infinity() }
+    var sign = 1.0
+    if lu.swaps % 2 == 1
+        sign = 0.0 - 1.0
+    LaLogDet { sign: sign, log_abs: log_abs }
 
 // LaLogDet is a log-determinant and the sign it lost.
 //
@@ -214,7 +458,15 @@ pub struct LaLogDet
 //
 // `LaSingular` when the factorisation's `U` has a zero on its diagonal.
 pub fn inverse(lu: LaLu) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.lalu.inverse")
+    let n = order(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var i = 0
+    while i < n
+        if packed[i * n + i] == 0.0
+            return Err(LaSingular(i, 0.0))
+        i = i + 1
+    let inv = solve_matrix(lu, array_of(identity(n), [n, n]))!
+    Ok(inv)
 
 // The product `L U` with the permutation undone — the original matrix,
 // reconstructed from the factors.
@@ -224,4 +476,18 @@ pub fn inverse(lu: LaLu) -> Result<NdFloat, LaFault> []
 // names.  It costs `n³` and exists for tests and for a reader checking
 // a factorisation by hand, not for a hot path.
 pub fn reconstruct(lu: LaLu) -> NdFloat []
-    todo("linalg-nv.lalu.reconstruct")
+    let n = order(lu)
+    let perm = permutation_indices(lu)
+    let l = ndfloat.to_list(lower(lu))
+    let u = ndfloat.to_list(upper(lu))
+    let prod = mul_square(l, u, n)
+    // Undo the permutation: `P A`'s row `i` is `A`'s row `perm[i]`, so
+    // row `perm[i]` of the answer is row `i` of `L U`.
+    var out = zeros(n * n)
+    for i in 0..n
+        let r = list.get(perm, i)
+        var j = 0
+        while j < n
+            out[r * n + j] = prod[i * n + j]
+            j = j + 1
+    array_of(out, [n, n])

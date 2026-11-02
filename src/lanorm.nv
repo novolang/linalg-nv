@@ -1,9 +1,6 @@
 // lanorm — matrix and vector norms, and the two questions that are
 // asked about a matrix before anything is done with it.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // FIVE MATRIX NORMS, AND THEY ARE NOT INTERCHANGEABLE.  `LaNorm` names
 // them, and the reason there are five is that they answer different
 // questions and differ by factors of `sqrt(n)`:
@@ -34,6 +31,141 @@
 // make every solve pay for an SVD.
 
 use ndfloat
+use lafault
+use lalu
+use lasvd
+
+// ── the arithmetic the norms are one pass each ──────────────────────
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    Ok(dims[:])
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// The entries of a vector operand, or the refusal that says why it is
+// not a vector.
+fn vector_of(x: NdFloat, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(x)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    Ok(ndfloat.to_list(x))
+
+// The sum of the squares of a flat list.
+fn sum_squares(xs: [Float]) -> Float
+    var s = 0.0
+    for i in 0..list.len(xs)
+        s = s + xs[i] * xs[i]
+    s
+
+// The sum of the absolute values of a flat list: its 1-norm.
+fn sum_abs(xs: [Float]) -> Float
+    var s = 0.0
+    for i in 0..list.len(xs)
+        s = s + math.abs(xs[i])
+    s
+
+// The largest absolute entry of a flat list.  Zero for an empty one,
+// which is the honest answer for a norm of nothing.
+fn max_abs(xs: [Float]) -> Float
+    var best = 0.0
+    for i in 0..list.len(xs)
+        let v = math.abs(xs[i])
+        if v > best
+            best = v
+    best
+
+// The largest absolute column sum of a flat row-major `rows`-by-`cols`
+// matrix.
+fn max_column_sum(xs: [Float], rows: Int, cols: Int) -> Float
+    var best = 0.0
+    var j = 0
+    while j < cols
+        var s = 0.0
+        var i = 0
+        while i < rows
+            s = s + math.abs(xs[i * cols + j])
+            i = i + 1
+        if s > best
+            best = s
+        j = j + 1
+    best
+
+// The largest absolute row sum.
+fn max_row_sum(xs: [Float], rows: Int, cols: Int) -> Float
+    var best = 0.0
+    var i = 0
+    while i < rows
+        var s = 0.0
+        var j = 0
+        while j < cols
+            s = s + math.abs(xs[i * cols + j])
+            j = j + 1
+        if s > best
+            best = s
+        i = i + 1
+    best
+
+// `A x = b` from an LU's factors: `P b`, forward through the unit
+// lower triangle, back through the upper one.
+//
+// `lalu.solve` is the public path and does exactly this; the estimator
+// needs the same loop on flat lists, plus the transpose solve beside
+// it, which the interface does not publish because nothing but a
+// condition estimate wants one.
+fn solve_from(lu: LaLu, b: [Float]) -> [Float]
+    let n = lalu.order(lu)
+    let perm = lalu.permutation_indices(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var y = zeros(n)
+    for i in 0..n
+        y[i] = b[list.get(perm, i)]
+    for i in 0..n
+        var s = y[i]
+        for j in 0..i
+            s = s - packed[i * n + j] * y[j]
+        y[i] = s
+    var i = n - 1
+    while i >= 0
+        var s = y[i]
+        for j in i + 1..n
+            s = s - packed[i * n + j] * y[j]
+        y[i] = s / packed[i * n + i]
+        i = i - 1
+    y
+
+// `Aᵀ x = b` from the same factors.
+//
+// `P A = L U`, so `Aᵀ = Uᵀ Lᵀ Pᵀ`: forward through `Uᵀ`, back through
+// `Lᵀ` — whose diagonal is ones and is not stored — and then `Pᵀ`,
+// which is the inverse of the permutation `solve_from` applies.
+fn solve_transpose_from(lu: LaLu, b: [Float]) -> [Float]
+    let n = lalu.order(lu)
+    let perm = lalu.permutation_indices(lu)
+    let packed = ndfloat.to_list(lu.packed)
+    var y = zeros(n)
+    for i in 0..n
+        var s = b[i]
+        for j in 0..i
+            s = s - packed[j * n + i] * y[j]
+        y[i] = s / packed[i * n + i]
+    var i = n - 1
+    while i >= 0
+        var s = y[i]
+        for j in i + 1..n
+            s = s - packed[j * n + i] * y[j]
+        y[i] = s
+        i = i - 1
+    var x = zeros(n)
+    for i in 0..n
+        x[list.get(perm, i)] = y[i]
+    x
 
 // LaNorm names which norm.
 //
@@ -76,7 +208,20 @@ pub enum LaNorm
 //         Err(e) => println(e.message())
 // ```
 pub fn norm(a: NdFloat, which: LaNorm) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.norm")
+    let dims = matrix_dims(a, "lanorm.norm")!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    let xs = ndfloat.to_list(a)
+    match which
+        LaNorm1         => Ok(max_column_sum(xs, rows, cols))
+        LaNormInf       => Ok(max_row_sum(xs, rows, cols))
+        LaNormFrobenius => Ok(math.sqrt(sum_squares(xs)))
+        LaNormMax       => Ok(max_abs(xs))
+        // The only one that is not one pass: the largest singular
+        // value, which needs the decomposition that produces it.
+        LaNorm2         =>
+            let s = lasvd.factor(a)!
+            Ok(lasvd.norm_2(s))
 
 // The Euclidean norm of a vector.
 //
@@ -86,7 +231,18 @@ pub fn norm(a: NdFloat, which: LaNorm) -> Result<Float, LaFault> []
 // difference between this and the naive loop is the entire reason
 // LAPACK has `dnrm2` instead of three lines.
 pub fn vector_norm(x: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.vector_norm")
+    let xs = vector_of(x, "lanorm.vector_norm")!
+    // Scaled rather than summed directly: the scale is the largest
+    // entry, so every square is at most one and a vector of entries
+    // around 1e200 does not overflow on the way to a finite answer.
+    let scale = max_abs(xs)
+    if scale == 0.0
+        return Ok(0.0)
+    var s = 0.0
+    for i in 0..list.len(xs)
+        let r = xs[i] / scale
+        s = s + r * r
+    Ok(scale * math.sqrt(s))
 
 // The p-norm of a vector, for a real `p` at or above 1.
 //
@@ -95,7 +251,15 @@ pub fn vector_norm(x: NdFloat) -> Result<Float, LaFault> []
 // would be answering a number that does not mean what its name says.
 // `inf` as `p` is the maximum absolute entry and is `vector_norm_inf`.
 pub fn vector_norm_p(x: NdFloat, p: Float) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.vector_norm_p")
+    let xs = vector_of(x, "lanorm.vector_norm_p")!
+    if p < 1.0
+        return Err(LaBadNormOrder(p))
+    if math.is_inf(p)
+        return Ok(max_abs(xs))
+    var s = 0.0
+    for i in 0..list.len(xs)
+        s = s + math.pow(math.abs(xs[i]), p)
+    Ok(math.pow(s, 1.0 / p))
 
 // The maximum absolute entry of a vector — its infinity norm.
 //
@@ -103,7 +267,8 @@ pub fn vector_norm_p(x: NdFloat, p: Float) -> Result<Float, LaFault> []
 // no float `p` that means infinity and passing a very large one gives
 // a wrong answer quietly.
 pub fn vector_norm_inf(x: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.vector_norm_inf")
+    let xs = vector_of(x, "lanorm.vector_norm_inf")!
+    Ok(max_abs(xs))
 
 // The dot product of two vectors.
 //
@@ -112,7 +277,14 @@ pub fn vector_norm_inf(x: NdFloat) -> Result<Float, LaFault> []
 // it is also what `vector_norm` and the Gram matrix below are written
 // in terms of.  `LaDimensionMismatch` when the lengths differ.
 pub fn dot(x: NdFloat, y: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.dot")
+    let xs = vector_of(x, "lanorm.dot")!
+    let ys = vector_of(y, "lanorm.dot")!
+    if list.len(xs) != list.len(ys)
+        return Err(LaDimensionMismatch(list.len(xs), list.len(ys)))
+    var s = 0.0
+    for i in 0..list.len(xs)
+        s = s + xs[i] * ys[i]
+    Ok(s)
 
 // The trace: the sum of the diagonal.
 //
@@ -120,7 +292,18 @@ pub fn dot(x: NdFloat, y: NdFloat) -> Result<Float, LaFault> []
 // eigenvalues, which is what makes it the cheapest thing that says
 // anything about a spectrum.
 pub fn trace(a: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.trace")
+    let dims = matrix_dims(a, "lanorm.trace")!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    let xs = ndfloat.to_list(a)
+    var s = 0.0
+    var i = 0
+    while i < rows
+        s = s + xs[i * cols + i]
+        i = i + 1
+    Ok(s)
 
 // The exact 2-norm condition number, from a singular value
 // decomposition.
@@ -129,7 +312,7 @@ pub fn trace(a: NdFloat) -> Result<Float, LaFault> []
 // that a caller who thinks in norms does not have to know which module
 // the SVD lives in.
 pub fn condition(s: LaSvd) -> Float []
-    todo("linalg-nv.lanorm.condition")
+    lasvd.condition(s)
 
 // An estimate of the 1-norm condition number, from an LU factorisation.
 //
@@ -146,7 +329,63 @@ pub fn condition(s: LaSvd) -> Float []
 // and the factorisation does not — `dgecon` takes it for the same
 // reason.
 pub fn condition_estimate(lu: LaLu, anorm: Float) -> Float []
-    todo("linalg-nv.lanorm.condition_estimate")
+    let n = lalu.order(lu)
+    if n == 0
+        return 1.0
+    // Hager's iteration.  `est` is the largest `||A⁻¹ e_j||₁` seen
+    // so far — measured, never inferred, because that is the number
+    // that is a lower bound on the norm by construction: the 1-norm of
+    // a matrix IS the largest of its columns' norms, so a column that
+    // has been looked at can never overshoot it.  Each pass solves
+    // once, takes the sign pattern of the answer, solves the transpose
+    // against it, and moves to the column that came out largest; it
+    // stops as soon as a pass fails to improve, which is usually after
+    // two.
+    var x = list.map(0..n, i => 1.0 / n as Float)
+    var est = 0.0
+    var going = true
+    var step = 0
+    while step < 5 and going
+        let y = solve_from(lu, x)
+        let yn = sum_abs(y)
+        if yn <= est
+            going = false
+        else
+            est = yn
+            var xi = zeros(n)
+            for i in 0..n
+                xi[i] = 1.0
+                if y[i] < 0.0
+                    xi[i] = 0.0 - 1.0
+            let z = solve_transpose_from(lu, xi)
+            var j = 0
+            var zmax = 0.0
+            for i in 0..n
+                let az = math.abs(z[i])
+                if az > zmax
+                    zmax = az
+                    j = i
+            // The stop test is Hager's: when the transpose solve's
+            // largest entry is no bigger than what `x` already
+            // extracts, no column of the inverse does better.
+            var ztx = 0.0
+            for i in 0..n
+                ztx = ztx + z[i] * x[i]
+            if zmax <= ztx
+                going = false
+            else
+                for i in 0..n
+                    x[i] = 0.0
+                x[j] = 1.0
+        step = step + 1
+    // The estimate is a LOWER bound — the 1-norm of a matrix is never
+    // below what one of its columns achieves — and the condition
+    // number of the identity is 1, which is the floor the product can
+    // honestly have.
+    var answer = anorm * est
+    if answer < 1.0
+        answer = 1.0
+    answer
 
 // How far from symmetric a matrix is: the Frobenius norm of
 // `A - Aᵀ`, relative to the Frobenius norm of `A`.
@@ -172,7 +411,31 @@ pub fn condition_estimate(lu: LaLu, anorm: Float) -> Float []
 //         Err(e) => println(e.message())
 // ```
 pub fn symmetry_defect(a: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.symmetry_defect")
+    let dims = matrix_dims(a, "lanorm.symmetry_defect")!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    // `A - Aᵀ` needs the two to be the same size; a non-square matrix
+    // has no transpose to be compared against.
+    if rows != cols
+        return Err(LaNotSquare(rows, cols))
+    let xs = ndfloat.to_list(a)
+    var d = 0.0
+    var i = 0
+    while i < rows
+        var j = i + 1
+        while j < cols
+            // Only the strict triangle, counted twice: the diagonal is
+            // its own transpose and contributes nothing.
+            let diff = xs[i * cols + j] - xs[j * cols + i]
+            d = d + 2.0 * diff * diff
+            j = j + 1
+        i = i + 1
+    let denom = math.sqrt(sum_squares(xs))
+    // A matrix of zeros is symmetric by the only reading that leaves
+    // this a measurement rather than a 0/0.
+    if denom == 0.0
+        return Ok(0.0)
+    Ok(math.sqrt(d) / denom)
 
 // How far from orthogonal a matrix is: the Frobenius norm of
 // `QᵀQ - I`.
@@ -184,4 +447,27 @@ pub fn symmetry_defect(a: NdFloat) -> Result<Float, LaFault> []
 // matrix by accumulating small rotations wants to know when it has
 // drifted.
 pub fn orthogonality_defect(q: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.lanorm.orthogonality_defect")
+    let dims = matrix_dims(q, "lanorm.orthogonality_defect")!
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    let xs = ndfloat.to_list(q)
+    // The Frobenius norm of `QᵀQ - I`, entry by entry.  `QᵀQ` is
+    // `cols` by `cols` whether the matrix is square, tall or wide, so
+    // this measures orthonormal COLUMNS either way, which is the form
+    // both factorisations here produce.
+    var d = 0.0
+    var i = 0
+    while i < cols
+        var j = 0
+        while j < cols
+            var s = 0.0
+            var k = 0
+            while k < rows
+                s = s + xs[k * cols + i] * xs[k * cols + j]
+                k = k + 1
+            if i == j
+                s = s - 1.0
+            d = d + s * s
+            j = j + 1
+        i = i + 1
+    Ok(math.sqrt(d))

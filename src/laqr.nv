@@ -1,9 +1,6 @@
 // laqr — the QR factorisation by Householder reflections, and the
 // least-squares solve that is what it is for.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT IT IS.  `A = Q R` for an `m x n` matrix with `m >= n`: `Q` has
 // orthonormal columns and `R` is upper triangular.
 //
@@ -38,6 +35,184 @@
 // complement needs.
 
 use ndfloat
+use lafault
+
+// ── the shapes, the buffers, and one reflection ─────────────────────
+//
+// Each module in this package carries its own copy of these few-line
+// helpers, the way `stats-nv`'s modules each carry an `array_of`: a
+// module's private functions are its own business, and the reflector
+// is the one thing in this module only this module knows how to apply.
+
+// The machine epsilon, give or take: the gap between 1.0 and the next
+// double.  A private constant because the standard library publishes
+// no such thing and a threshold for "this diagonal entry is zero in
+// every sense that matters" is a number this module has to own.
+const LAQR_EPSILON = 2.220446049250313e-16
+
+// The extents of a rank-2 array, or the refusal that says why it is
+// not a matrix.  A zero dimension is refused here rather than later:
+// every decomposition of an empty matrix is defensible and none of
+// them is useful.
+fn matrix_dims(a: NdFloat, what: Str) -> Result<[Int], LaFault>
+    let dims = ndfloat.shape(a).dims
+    if list.len(dims) != 2
+        return Err(LaNotMatrix(what, list.len(dims)))
+    let rows = list.get(dims, 0)
+    let cols = list.get(dims, 1)
+    if rows == 0 or cols == 0
+        return Err(LaEmptyMatrix(rows, cols))
+    Ok(dims[:])
+
+// A flat list of `n` zeroes.
+fn zeros(n: Int) -> [Float]
+    list.map(0..n, i => 0.0)
+
+// A flat row-major `n`-by-`n` identity.
+fn identity(n: Int) -> [Float]
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        out[i * n + i] = 1.0
+        i = i + 1
+    out
+
+// An array over a flat list at these dims.  Every caller here builds
+// the list to the length the dims describe, so the array underneath
+// had nothing to refuse.
+fn array_of(xs: [Float], dims: [Int]) -> NdFloat
+    ndfloat.of_list(xs, dims)!
+
+// The length of a vector operand, or the refusal that says why it is
+// not one of the length the reflector needs.
+fn vector_of(b: NdFloat, n: Int, what: Str) -> Result<[Float], LaFault>
+    let r = ndfloat.rank(b)
+    if r != 1
+        return Err(LaNotVector(what, r))
+    let xs = ndfloat.to_list(b)
+    if list.len(xs) != n
+        return Err(LaDimensionMismatch(n, list.len(xs)))
+    Ok(xs)
+
+// Apply reflector `k` to a flat `cols`-column buffer of `m` rows, in
+// place.
+//
+// The reflector is `I - tau v vᵀ` with `v[k] = 1` implicit and
+// `v[i] = packed[i][k]` below it — LAPACK's `dgeqrf` layout, which is
+// what `LaQr.packed` holds.  A reflector with a zero `tau` is the
+// identity and costs nothing, which is what a zero column leaves
+// behind.
+fn reflect(qr: LaQr, k: Int, var work: [Float], cols: Int)
+    let tau = list.get(qr.tau, k)
+    if tau == 0.0
+        return
+    let m = qr.m
+    let n = qr.n
+    let packed = ndfloat.to_list(qr.packed)
+    var j = 0
+    while j < cols
+        var s = work[k * cols + j]
+        var i = k + 1
+        while i < m
+            s = s + packed[i * n + k] * work[i * cols + j]
+            i = i + 1
+        s = tau * s
+        work[k * cols + j] = work[k * cols + j] - s
+        i = k + 1
+        while i < m
+            work[i * cols + j] = work[i * cols + j] - packed[i * n + k] * s
+            i = i + 1
+        j = j + 1
+
+// Apply all the reflectors to a flat `cols`-column buffer of `m` rows.
+//
+// The order is the whole of it.  `Q = H₁ H₂ … Hₙ`, so applying `Q`
+// applies `Hₙ` first and walks back down; `Qᵀ = Hₙ … H₁`, so applying
+// it walks the other way.  Getting this backwards answers `Qᵀ` from
+// `apply_q` — and every identity in the suite that multiplies a
+// factor back still passes, because `Qᵀ Q = I` either way.
+fn reflect_all(qr: LaQr, var work: [Float], cols: Int, transpose: Bool)
+    if transpose
+        var k = 0
+        while k < qr.n
+            reflect(qr, k, var work, cols)
+            k = k + 1
+    else
+        var k = qr.n - 1
+        while k >= 0
+            reflect(qr, k, var work, cols)
+            k = k - 1
+
+// Apply `Q` or `Qᵀ` to a vector or a matrix without forming `Q`, with
+// the shape checks both published entry points share.
+fn q_apply(qr: LaQr, x: NdFloat, transpose: Bool, what: Str) -> Result<NdFloat, LaFault>
+    let m = qr.m
+    let r = ndfloat.rank(x)
+    if r == 1
+        var xs = vector_of(x, m, what)!
+        reflect_all(qr, var xs, 1, transpose)
+        Ok(array_of(xs, [m]))
+    elif r == 2
+        let dims = ndfloat.shape(x).dims
+        let rows = list.get(dims, 0)
+        let cols = list.get(dims, 1)
+        if rows != m
+            return Err(LaDimensionMismatch(m, rows))
+        var work = ndfloat.to_list(x)
+        reflect_all(qr, var work, cols, transpose)
+        Ok(array_of(work, [m, cols]))
+    else
+        Err(LaNotMatrix(what, r))
+
+// `Qᵀ y` for a flat vector of `m` entries, in place.
+//
+// The least-squares path wants the projected vector rather than an
+// array of it, and one copy is one too many.
+fn apply_q_transpose_flat(qr: LaQr, var y: [Float])
+    reflect_all(qr, var y, 1, true)
+
+// The scale of `R`'s diagonal, or the refusal when one entry is small
+// enough that the back-substitution would be dividing by rounding.
+//
+// **Compared RELATIVE to the largest diagonal entry, and it has to
+// be.**  A rank-deficient `R` does not carry an exact zero: the entry
+// that should be zero comes out of the reflectors at around 1e-16
+// times the scale of the matrix, so a test against zero would pass
+// every singular system through.  One epsilon per row of the trailing
+// matrix is the standard bound for what a stable factorisation leaves
+// behind.
+fn require_nonsingular(qr: LaQr) -> Result<Float, LaFault>
+    let n = qr.n
+    let packed = ndfloat.to_list(qr.packed)
+    var scale = 0.0
+    var i = 0
+    while i < n
+        let d = math.abs(packed[i * n + i])
+        if d > scale
+            scale = d
+        i = i + 1
+    let floor = LAQR_EPSILON * n as Float * scale
+    i = 0
+    while i < n
+        let d = math.abs(packed[i * n + i])
+        if d <= floor
+            return Err(LaSingular(i, d))
+        i = i + 1
+    Ok(scale)
+
+// `x` such that `R x = y`, back-substituted through the packed `R`.
+fn back_substitute(qr: LaQr, y: [Float]) -> [Float]
+    let n = qr.n
+    let packed = ndfloat.to_list(qr.packed)
+    var x = y[:]
+    var i = n - 1
+    while i >= 0
+        var s = x[i]
+        for j in i + 1..n
+            s = s - packed[i * n + j] * x[j]
+        x[i] = s / packed[i * n + i]
+        i = i - 1
+    x
 
 // LaQr is the QR factorisation of an `m x n` matrix with `m >= n`,
 // stored as Householder reflectors rather than as `Q`.
@@ -83,15 +258,75 @@ pub struct LaQr
 // `R`'s diagonal.  `lasvd` is what detects rank; `lstsq` says what it
 // does when it meets one.
 pub fn factor(a: NdFloat) -> Result<LaQr, LaFault> []
-    todo("linalg-nv.laqr.factor")
+    let dims = matrix_dims(a, "laqr.factor")!
+    let m = list.get(dims, 0)
+    let n = list.get(dims, 1)
+    if m < n
+        return Err(LaUnderdetermined(m, n))
+    var work = ndfloat.to_list(a)
+    var taus = zeros(n)
+    for k in 0..n
+        // The norm of the column from the diagonal down.  A column that
+        // is entirely zero has no reflector — and leaves `R` with a
+        // zero on its diagonal, which is the rank deficiency `lstsq`
+        // refuses and `lasvd` detects.
+        var nrm = 0.0
+        var i = k
+        while i < m
+            nrm = nrm + work[i * n + k] * work[i * n + k]
+            i = i + 1
+        nrm = math.sqrt(nrm)
+        if nrm != 0.0
+            // The reflection that carries the column onto `alpha e_k`.
+            // `alpha` takes the sign of the far end so that `beta`,
+            // the distance the first entry travels, is a SUM of two
+            // magnitudes rather than a difference: the difference is
+            // where the cancellation would be.
+            let x0 = work[k * n + k]
+            var alpha = 0.0 - nrm
+            if x0 < 0.0
+                alpha = nrm
+            let beta = x0 - alpha
+            // Store the reflector below the diagonal, scaled so that
+            // its leading entry is 1 — `dgeqrf`'s layout, and the
+            // scaling that keeps the stored numbers bounded.
+            var vnorm = 1.0
+            var i2 = k + 1
+            while i2 < m
+                let vi = work[i2 * n + k] / beta
+                work[i2 * n + k] = vi
+                vnorm = vnorm + vi * vi
+                i2 = i2 + 1
+            taus[k] = 2.0 / vnorm
+            let tau = taus[k]
+            // The reflection of everything to the right of the
+            // diagonal.  The column itself does not need it: it becomes
+            // `alpha e_k` by construction, and the tail just stored IS
+            // the reflector.
+            var j = k + 1
+            while j < n
+                var s = work[k * n + j]
+                var i3 = k + 1
+                while i3 < m
+                    s = s + work[i3 * n + k] * work[i3 * n + j]
+                    i3 = i3 + 1
+                s = tau * s
+                work[k * n + j] = work[k * n + j] - s
+                i3 = k + 1
+                while i3 < m
+                    work[i3 * n + j] = work[i3 * n + j] - work[i3 * n + k] * s
+                    i3 = i3 + 1
+                j = j + 1
+            work[k * n + k] = alpha
+    Ok(LaQr { packed: array_of(work, dims), tau: taus, m: m, n: n })
 
 // How many rows the factored matrix had.
 pub fn rows(qr: LaQr) -> Int []
-    todo("linalg-nv.laqr.rows")
+    qr.m
 
 // How many columns.
 pub fn cols(qr: LaQr) -> Int []
-    todo("linalg-nv.laqr.cols")
+    qr.n
 
 // The full `m x m` orthogonal `Q`.
 //
@@ -100,14 +335,29 @@ pub fn cols(qr: LaQr) -> Int []
 // columns beyond the first `n` span the orthogonal complement of `A`'s
 // column space, which is what makes the full form worth having at all.
 pub fn q(qr: LaQr) -> NdFloat []
-    todo("linalg-nv.laqr.q")
+    let m = qr.m
+    // `Q = H₁ H₂ … Hₙ`, so forming it means multiplying them into the
+    // identity from the right: the last reflector is applied first.
+    var work = identity(m)
+    reflect_all(qr, var work, m, false)
+    array_of(work, [m, m])
 
 // The thin `m x n` `Q`: the first `n` columns, orthonormal, not square.
 //
 // The economy factorisation, and the one a least-squares fit uses.  See
 // the module comment for why both forms are published.
 pub fn q_thin(qr: LaQr) -> NdFloat []
-    todo("linalg-nv.laqr.q_thin")
+    let m = qr.m
+    let n = qr.n
+    // The first `n` columns of the identity, reflected: the economy
+    // factorisation, without ever building the `m x m` one.
+    var work = zeros(m * n)
+    var i = 0
+    while i < n
+        work[i * n + i] = 1.0
+        i = i + 1
+    reflect_all(qr, var work, n, false)
+    array_of(work, [m, n])
 
 // The upper-triangular `R`, as an `n x n` matrix.
 //
@@ -115,7 +365,17 @@ pub fn q_thin(qr: LaQr) -> NdFloat []
 // construction, so this is the thin form and the only one with
 // anything in it.
 pub fn r(qr: LaQr) -> NdFloat []
-    todo("linalg-nv.laqr.r")
+    let n = qr.n
+    let packed = ndfloat.to_list(qr.packed)
+    var out = zeros(n * n)
+    var i = 0
+    while i < n
+        var j = i
+        while j < n
+            out[i * n + j] = packed[i * qr.n + j]
+            j = j + 1
+        i = i + 1
+    array_of(out, [n, n])
 
 // `Q x` for a vector or `Q X` for a matrix, without forming `Q`.
 //
@@ -126,14 +386,14 @@ pub fn r(qr: LaQr) -> NdFloat []
 // `LaDimensionMismatch` when the operand's leading dimension is not
 // `m`.
 pub fn apply_q(qr: LaQr, x: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laqr.apply_q")
+    q_apply(qr, x, false, "laqr.apply_q")
 
 // `Qᵀ x`, without forming `Q`.
 //
 // The direction a least-squares solve actually uses: `min ||Ax - b||`
 // is `R x = Qᵀ b` back-substituted, and `Qᵀ b` is this call.
 pub fn apply_q_transpose(qr: LaQr, x: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laqr.apply_q_transpose")
+    q_apply(qr, x, true, "laqr.apply_q_transpose")
 
 // `x` minimising `||A x - b||₂`, for a vector `b`.
 //
@@ -173,7 +433,16 @@ pub fn apply_q_transpose(qr: LaQr, x: NdFloat) -> Result<NdFloat, LaFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn lstsq(qr: LaQr, b: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laqr.lstsq")
+    let n = qr.n
+    var projected = vector_of(b, qr.m, "laqr.lstsq")!
+    apply_q_transpose_flat(qr, var projected)
+    // The top `n` entries are what `R x = Qᵀb` needs; the rest are the
+    // residual, which `residual_norm` reads without multiplying back.
+    var top = zeros(n)
+    for i in 0..n
+        top[i] = projected[i]
+    require_nonsingular(qr)!
+    Ok(array_of(back_substitute(qr, top), [n]))
 
 // The residual norm `||A x - b||₂` at the least-squares solution,
 // without forming `A x`.
@@ -182,7 +451,14 @@ pub fn lstsq(qr: LaQr, b: NdFloat) -> Result<NdFloat, LaFault> []
 // `m - n` entries of `Qᵀ b` IS the residual, so a caller who wants to
 // know how good the fit was should ask this rather than multiply back.
 pub fn residual_norm(qr: LaQr, b: NdFloat) -> Result<Float, LaFault> []
-    todo("linalg-nv.laqr.residual_norm")
+    let n = qr.n
+    let m = qr.m
+    var projected = vector_of(b, m, "laqr.residual_norm")!
+    apply_q_transpose_flat(qr, var projected)
+    var s = 0.0
+    for i in n..m
+        s = s + projected[i] * projected[i]
+    Ok(math.sqrt(s))
 
 // `x` such that `R x = y`, back-substituted.
 //
@@ -192,11 +468,19 @@ pub fn residual_norm(qr: LaQr, b: NdFloat) -> Result<Float, LaFault> []
 //
 // `LaSingular` when `R` has a zero on its diagonal.
 pub fn solve_r(qr: LaQr, y: NdFloat) -> Result<NdFloat, LaFault> []
-    todo("linalg-nv.laqr.solve_r")
+    let n = qr.n
+    let ys = vector_of(y, n, "laqr.solve_r")!
+    require_nonsingular(qr)!
+    Ok(array_of(back_substitute(qr, ys), [n]))
 
 // The product `Q R` — the original matrix, reconstructed.
 //
 // The round trip every decomposition owes.  `m²n`, for tests and for a
 // reader checking by hand.
 pub fn reconstruct(qr: LaQr) -> NdFloat []
-    todo("linalg-nv.laqr.reconstruct")
+    // The thin factorisation is the one that multiplies back: `m x n`
+    // times `n x n` is the whole of `A`, and the full `Q` would only
+    // be multiplying the zero rows below `R`.
+    let thin = q_thin(qr)
+    let rr = r(qr)
+    ndfloat.matmul(thin, rr)!
