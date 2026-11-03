@@ -69,6 +69,12 @@ makes it work, and no signature changed.
   was added; the oracle checks the reconstruction against the identity
   only, which swaps nothing.
 
+This release requires novo 0.23.0 or later.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A
